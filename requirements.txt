@@ -1,0 +1,9 @@
+streamlit
+librosa
+soundfile
+matplotlib
+numpy
+pillow
+scipy
+imageio
+imageio-ffmpeg
