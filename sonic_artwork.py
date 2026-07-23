@@ -672,60 +672,9 @@ def _rose_frame(a, cmap, bg, size, mirror, thickness, inner, rotation,
     return fig_to_pil(fig, size)
 
 
-def animate_rose(audio, cmap, bg, params, out_path, duration=5.0, fps=24,
-                 aspect="9x16_Story_Reel_Canvas", rotate_turns=0.25, react=1.0,
-                 mirror=True, smoothing=0.35, with_audio=True):
-    """react: 0 = globales Pulsieren (statisches Spektrum),
-              1 = jeder Bin folgt seiner Frequenz ueber die Zeit.
-       smoothing: 0 = roh/zappelig, ->1 = traeger/weicher.
-       with_audio: Originalton unter das Video muxen (ffmpeg)."""
-    import imageio
-    y, sr = load_audio(audio, end=duration)
-    duration = min(duration, len(y) / sr)            # nicht laenger als der Track
-    nm = params.get("n_mels", 110)
-    S = punch(norm01(mel_db(y, sr, nm)),                 # n_mels x T, global normiert
-              params.get("gate", 0.15), params.get("gamma", 1.4))
-    a0 = S.mean(axis=1)                                  # statische Referenz
-    T = S.shape[1]
-
-    W, H = SIZES[aspect]
-    W -= W % 2; H -= H % 2
-    side = int(min(W, H) * 0.96)
-    bg_rgb = _hex_rgb(bg)
-    thick0 = params.get("thickness", 1.0); rot0 = params.get("rotation", 0.0)
-    inner = params.get("inner", 0.15); dthick = params.get("data_thickness", True)
-
-    frames = int(duration * fps)
-    video_target = out_path
-    if with_audio:                                   # zuerst stummes Video, dann muxen
-        import tempfile as _tf
-        video_target = _tf.NamedTemporaryFile(suffix=".mp4", delete=False).name
-
-    writer = imageio.get_writer(video_target, fps=fps, codec="libx264",
-                                quality=8, macro_block_size=None)
-    prev = None
-    for f in range(frames):
-        p = f / max(1, frames - 1)
-        c1 = int(p * (T - 1))
-        c0 = int((f - 1) / max(1, frames - 1) * (T - 1)) if f > 0 else c1
-        live = S[:, min(c0, c1):max(c0, c1) + 1].mean(axis=1)   # Fenster -> Spalte(n)
-        a = (1 - react) * a0 + react * live                     # global <-> pro Bin
-        if prev is not None:
-            a = smoothing * prev + (1 - smoothing) * a          # zeitliche Glaettung
-        prev = a
-        rot = rot0 + rotate_turns * 360.0 * p                   # Drehen
-        art = _rose_frame(a, cmap, bg, side, mirror,
-                          thick0, inner, rot, dthick)
-        canvas = Image.new("RGB", (W, H), bg_rgb)
-        canvas.paste(art, ((W - side) // 2, (H - side) // 2))
-        writer.append_data(np.asarray(canvas))
-    writer.close()
-
-    if not with_audio:
-        return out_path
-
-    # --- Originalton in Videolaenge schneiden und muxen ---
-    import subprocess, tempfile as _tf, imageio_ffmpeg, soundfile as _sf
+def _mux_audio(audio, silent_path, out_path, duration):
+    """Originalton (nativ, auf Videolaenge geschnitten) unter das Video legen."""
+    import subprocess, tempfile as _tf, imageio_ffmpeg, soundfile as _sf, shutil
     try:
         if hasattr(audio, "seek"):
             audio.seek(0)
@@ -733,16 +682,133 @@ def animate_rose(audio, cmap, bg, params, out_path, duration=5.0, fps=24,
         awav = _tf.NamedTemporaryFile(suffix=".wav", delete=False).name
         _sf.write(awav, ay.T if ay.ndim > 1 else ay, asr)
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([exe, "-y", "-i", video_target, "-i", awav,
+        subprocess.run([exe, "-y", "-i", silent_path, "-i", awav,
                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        "-shortest", out_path],
-                       check=True, capture_output=True)
-        return out_path
+                        "-shortest", out_path], check=True, capture_output=True)
+        return True
     except Exception:
-        # Fallback: stummes Video ausliefern
-        import shutil
-        shutil.copy(video_target, out_path)
-        return out_path
+        shutil.copy(silent_path, out_path)
+        return False
+
+
+def _canvas_setup(aspect):
+    W, H = SIZES[aspect]
+    W -= W % 2; H -= H % 2
+    return W, H, int(min(W, H) * 0.96)
+
+
+# ----------------------------------------------------------------------
+# Video-Animation.  Drehung IMMER im Uhrzeigersinn (rechts herum).
+# Alle Modi rendern pro Frame den aktuellen Moment.
+# ----------------------------------------------------------------------
+VIDEO_MODES = ["Rose gespiegelt", "Rose roh",
+               "Live-Kreisspektrum", "Live-Oszilloskop"]
+
+
+def _spectrum_frame(a, cmap, bg, size, mirror, thickness, inner, rotation):
+    """Aktuelles Spektrum als Balkenkranz (voll oder gespiegelt)."""
+    aa = np.clip(a, 0, 1); N = len(aa)
+    fig, ax = _polar_fig(size, bg, rotation=rotation)
+    if mirror:
+        w = (np.pi / N) * thickness * (0.5 + 1.0 * aa)
+        right = np.pi / 2 - np.linspace(0, np.pi, N)
+        left = np.pi / 2 + np.linspace(0, np.pi, N)
+        ax.bar(right, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
+        ax.bar(left, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
+    else:
+        w = (2 * np.pi / N) * thickness * (0.5 + 1.0 * aa)
+        ang = np.linspace(0, 2 * np.pi, N, endpoint=False)
+        ax.bar(ang, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
+    return fig_to_pil(fig, size)
+
+
+def _scope_frame(w, cmap, bg, size, thickness, inner, rotation):
+    """Aktuelles Wellenform-Fenster als geschlossener Ring (Oszilloskop)."""
+    n = len(w)
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    base = inner + 0.45
+    amp = np.clip(w, -1, 1) * 0.3 * thickness
+    th = np.append(theta, theta[0]); rr = np.append(base + amp, base + amp[0])
+    fig, ax = _polar_fig(size, bg, rotation=rotation)
+    pts = np.column_stack([th, rr])
+    segs = np.stack([pts[:-1], pts[1:]], axis=1)
+    lc = LineCollection(segs, colors=cmap(np.abs(np.append(amp, amp[0]))[:-1] /
+                                          (np.abs(amp).max() + 1e-9)),
+                        linewidths=2.6 * thickness)
+    ax.add_collection(lc)
+    ax.fill_between(th, base, rr, color=cmap(0.5), alpha=0.28, lw=0)
+    ax.set_ylim(0, 1.1)
+    return fig_to_pil(fig, size)
+
+
+def animate(audio, mode, cmap, bg, params, out_path, duration=5.0, fps=24,
+            aspect="9x16_Story_Reel_Canvas", rotate_turns=0.25, react=1.0,
+            smoothing=0.35, with_audio=True, effects=None, spin=True):
+    """Video-Renderer. Dreht immer rechts herum (Uhrzeigersinn).
+       effects: dict wie in build() -> wird auf jeden Frame angewendet."""
+    import imageio, tempfile as _tf
+    y, sr = load_audio(audio, end=duration)
+    duration = min(duration, len(y) / sr)
+    nm = params.get("n_mels", 110)
+    thick0 = params.get("thickness", 1.0); rot0 = params.get("rotation", 0.0)
+    inner = params.get("inner", 0.15)
+    mirror = (mode != "Rose roh")
+    turns = rotate_turns if spin else 0.0
+
+    is_scope = (mode == "Live-Oszilloskop")
+    if not is_scope:
+        S = punch(norm01(mel_db(y, sr, nm)),
+                  params.get("gate", 0.15), params.get("gamma", 1.4))
+        a0 = S.mean(axis=1); T = S.shape[1]
+
+    feat = features(y, sr) if effects else None
+    W, H, side = _canvas_setup(aspect)
+    bg_rgb = _hex_rgb(bg)
+    frames = int(duration * fps)
+    target = _tf.NamedTemporaryFile(suffix=".mp4", delete=False).name if with_audio else out_path
+    writer = imageio.get_writer(target, fps=fps, codec="libx264",
+                                quality=8, macro_block_size=None)
+    prev = None
+    win = int(sr / max(1, fps) * 2)                       # Fenster fuers Oszilloskop
+    for f in range(frames):
+        p = f / max(1, frames - 1)
+        rot = rot0 - turns * 360.0 * p                    # MINUS = rechts herum
+        if is_scope:
+            c = int(p * max(1, len(y) - win))
+            seg = y[c:c + win]
+            if len(seg) < win:
+                seg = np.pad(seg, (0, win - len(seg)))
+            step = max(1, len(seg) // 720)
+            wv = seg[::step][:720]
+            wv = wv / (np.abs(y).max() + 1e-9)
+            if prev is not None and len(prev) == len(wv):
+                wv = smoothing * prev + (1 - smoothing) * wv
+            prev = wv
+            art = _scope_frame(wv, cmap, bg, side, thick0, inner, rot)
+        else:
+            c1 = int(p * (T - 1))
+            c0 = int((f - 1) / max(1, frames - 1) * (T - 1)) if f > 0 else c1
+            live = S[:, min(c0, c1):max(c0, c1) + 1].mean(axis=1)
+            a = (1 - react) * a0 + react * live
+            if prev is not None and len(prev) == len(a):
+                a = smoothing * prev + (1 - smoothing) * a
+            prev = a
+            if mode == "Live-Kreisspektrum":
+                art = _spectrum_frame(a, cmap, bg, side, False, thick0, inner, rot)
+            else:
+                art = _rose_frame(a, cmap, bg, side, mirror, thick0, inner, rot,
+                                  params.get("data_thickness", True))
+        if effects:
+            art = apply_effects(art, feat, bg=bg, **effects)
+        canvas = Image.new("RGB", (W, H), bg_rgb)
+        canvas.paste(art.convert("RGB"), ((W - side) // 2, (H - side) // 2))
+        writer.append_data(np.asarray(canvas))
+    writer.close()
+    if with_audio:
+        _mux_audio(audio, target, out_path, duration)
+    return out_path
+
+
 
 
 # ----------------------------------------------------------------------
@@ -1009,23 +1075,34 @@ def main():
             except Exception as e:
                 st.error(f"Batch-Fehler: {e}")
 
-    with st.expander("Video (Canvas / Reel) — animierte Rose"):
+    with st.expander("Video (Canvas / Reel)"):
+        v_mode = st.selectbox("Video-Modus", VIDEO_MODES,
+                              index=VIDEO_MODES.index(mode) if mode in VIDEO_MODES else 2)
         v_asp = st.selectbox("Format", list(SIZES.keys()), index=2)
         v_dur = st.number_input("Dauer (s)", 2.0, 300.0, 5.0, 1.0,
                                 help="Spotify Canvas max. 8 s; Renderzeit steigt linear.")
         v_fps = st.select_slider("FPS", options=[12, 24, 30], value=24)
-        v_turn = st.slider("Drehung (Umdrehungen)", 0.0, 1.0, 0.25, 0.05)
-        v_react = st.slider("Bin-Bewegung (0=global, 1=pro Frequenz)", 0.0, 1.0, 1.0, 0.05)
+        v_spin = st.checkbox("Drehen (immer rechts herum)", value=True)
+        v_turn = st.slider("Umdrehungen", 0.0, 2.0, 0.25, 0.05,
+                           help="Wie oft sich das Bild waehrend des Videos dreht.")
         v_smooth = st.slider("Glaettung (gegen Zappeln)", 0.0, 0.9, 0.35, 0.05)
+        v_react = (st.slider("Bin-Bewegung (0=global, 1=pro Frequenz)", 0.0, 1.0, 1.0, 0.05)
+                   if v_mode != "Live-Oszilloskop" else 1.0)
+        v_fx = st.checkbox("Effekte auch im Video anwenden", value=True,
+                           help="Nutzt die Effekt-Einstellungen aus der Seitenleiste. "
+                                "Erhoeht die Renderzeit deutlich.")
         v_audio = st.checkbox("Originalton einbetten", value=True)
         if st.button("Video erzeugen"):
             try:
+                vparams = dict(base)
+                vparams["data_thickness"] = data_thick
                 with st.spinner("Rendere Video (kann dauern) ..."):
                     outp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-                    animate_rose(up, cmap, bg, base, outp, duration=v_dur, fps=v_fps,
-                                 aspect=v_asp, rotate_turns=v_turn, react=v_react,
-                                 mirror=(mode != "Rose roh"), smoothing=v_smooth,
-                                 with_audio=v_audio)
+                    animate(up, v_mode, cmap, bg, vparams, outp,
+                            duration=v_dur, fps=v_fps, aspect=v_asp,
+                            rotate_turns=v_turn, spin=v_spin, react=v_react,
+                            smoothing=v_smooth, with_audio=v_audio,
+                            effects=(fx_use if v_fx else None))
                     vbytes = open(outp, "rb").read()
                 st.video(vbytes)
                 st.download_button("MP4 laden", vbytes, "visualizer.mp4", "video/mp4")
