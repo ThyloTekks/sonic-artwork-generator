@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Umgebung (pro Projekt). .envrc ist lokale Werkzeugkonfiguration:
+# eine Zeile "source .venv/bin/activate" fuer direnv.
+.envrc
+.venv/
+.direnv/
+
+# Ausgaben
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.mp4
+*.zip
+!docs/**
+out/
+cover/
+
+# macOS
+.DS_Store

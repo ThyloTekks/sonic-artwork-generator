@@ -1,994 +1,1108 @@
-"""
-Sonic Artwork — Audio -> Cover  (Project Tree)
-==============================================
-Drei Modi, drei Kernregler, editierbare Palette (Presets / Farbwaehler / .cube-LUT).
+"""Sonic Artwork — Audio -> Cover.
+
+Streamlit-Oberflaeche. Die Rechenarbeit liegt im Paket `sonicart`:
+
+    sonicart/analysis.py    Audio einmal analysieren, Ergebnisse cachen
+    sonicart/render/        die Bildmodi
+    sonicart/artwork.py     Rezept + Pipeline
+    sonicart/album.py       Serie statt Einzelbild
+    sonicart/cli.py         dasselbe ohne Browser
 
 Start:  streamlit run sonic_artwork.py
-Deps:   pip install streamlit librosa soundfile matplotlib numpy pillow
+CLI:    python -m sonicart --help
 """
 
+from __future__ import annotations
+
 import io
-import numpy as np
-import librosa
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, ListedColormap
-from matplotlib.collections import LineCollection
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+import json
+import os
+import tempfile
+
+import streamlit as st
+from PIL import Image
+
+from sonicart.album import render_album
+from sonicart.analysis import Analysis, load
+from sonicart.artwork import DEFAULT_PARAMS, Recipe, build
+from sonicart.compose import IMAGE_MODES, LAYOUTS, MIX_BLENDS
+from sonicart.effects import DEFAULTS as FX_DEFAULTS
+from sonicart.export import (PLATFORM_SPECS, SIZES, export_formats, export_svg,
+                             export_svg_layers, formats_zip, platform_check,
+                             print_report, read_recipe, save_jpeg, save_png,
+                             svg_zip)
+from sonicart.palette import (HARMONIES, PRESETS, PROFILE_BG, cmap_from_cube,
+                              generate_palette, make_cmap, palette_from_key)
+from sonicart.render import MODES
+from sonicart.riso import INK_SETS, RisoSpec, ink_set
+from sonicart.typography import (ANCHORS, CONTRAST_MODES, FONT_PAIRS,
+                                 SAFE_AREAS, TYPEFACES, available_faces,
+                                 draw_safe_area)
+from sonicart.video import SPOTIFY_CANVAS, VIDEO_MODES, loop_length
+
+PREVIEW_PX = 700
+
 
 # ----------------------------------------------------------------------
-# Profile: nur Defaults. Palette ist im UI frei aenderbar.
+# Analyse-Cache
 # ----------------------------------------------------------------------
-PRESETS = {
-    "Korrend":    ["#08060d", "#3a1d6e", "#7b2ff7", "#c9a0ff"],
-    "Type Drift": ["#1a1712", "#5c4a32", "#b08d57", "#e8d8b8"],
-    "Seek":       ["#0d0606", "#7a1420", "#e23b2e", "#ffb37a"],
-    "Monochrom":  ["#000000", "#666666", "#ffffff"],
+#  cache_resource statt cache_data: Analysis rechnet beim ersten Zugriff nach
+#  und merkt sich das im Objekt. cache_data wuerde bei jedem Rerun eine Kopie
+#  zurueckgeben und die Nachberechnungen wegwerfen.
+@st.cache_resource(show_spinner=False, max_entries=6)
+def get_analysis(data: bytes, name: str) -> Analysis:
+    return load(io.BytesIO(data), name=name)
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def get_lut(data: bytes):
+    p = tempfile.NamedTemporaryFile(suffix=".cube", delete=False)
+    p.write(data)
+    p.close()
+    return cmap_from_cube(p.name)
+
+
+#  Voreinstellung ist ein matter Druck, kein leuchtendes Diagramm: Papier
+#  statt Schwarz, Bloom aus, Riso-Schicht an, und als Startmodus das Gitter
+#  statt einer weiteren zentrierten Scheibe.
+_MATT = Recipe.matte("Zinnober", mode="Gitter")
+
+DEFAULTS = {
+    "k_mode": _MATT.mode, "k_mixon": False, "k_mixblend": _MATT.mix_blend,
+    "k_preset": "Korrend",
+    "k_thick": 1.0, "k_gate": 0.15, "k_gamma": 1.5, "k_rot": 0, "k_inner": 0.15,
+    "k_nmels": 110, "k_dthick": True, "k_onset": 0.25, "k_spoke": 0.35,
+    "k_sym": 1, "k_symauto": False, "k_turns": 5.0, "k_marks": True,
+    "k_nseg": 0, "k_gap": 2.0, "k_labelring": True, "k_source": "mix",
+    "k_fxon": True, "k_fxint": 0.5, "k_g": True, "k_b": False, "k_c": False,
+    "k_seed": 0, "k_vig": 0.0, "k_post": 0, "k_half": 0, "k_streaks": 0.0,
+    "k_depth": 0.0,
+    # Druckschicht
+    "k_riso_on": True, "k_inkset": "Zinnober", "k_paper": _MATT.riso["paper"],
+    "k_cell": 5.0, "k_misreg": 1.0, "k_texture": 0.06, "k_gain": 1.0,
+    "k_invert": False, "k_overprint": "auto",
+    # Normierung und neue Modi
+    "k_whiten": 0.85, "k_tilt": 0.6, "k_stufen": 5, "k_gap_gitter": 0.055,
+    "k_spalten": 0, "k_baender": 7, "k_amp": 0.8, "k_glaette": 0.0,
+    "k_bandfarbe": False,
+    "k_layout": "Zentriert", "k_lscale": 1.0,
+    "k_artist": "", "k_title": "", "k_label": "", "k_catalog": "",
+    "k_tanchor": "unten links", "k_tsize": 0.052, "k_ttrack": 0.0,
+    "k_tupper": False, "k_tcolor": "#ffffff", "k_tshadow": 0.0, "k_tmargin": 0.07,
+    "k_safe": "Aus",
+    # Schriften und Lesbarkeit
+    "k_pair": "Display / Grotesk / Mono",
+    "k_face_title": "Bebas Neue", "k_face_artist": "Space Grotesk",
+    "k_face_meta": "Space Mono", "k_wtitle": "", "k_wartist": "Medium",
+    "k_titleupper": True, "k_ttrack_title": 0.04, "k_linegap": 0.38,
+    "k_maxw": 0.86, "k_rule": 0.0,
+    "k_contrast": "Farbe umschalten", "k_contrastmin": 4.5,
+    "k_size": 3000, "k_transp": False, "k_fmt": "PNG", "k_live": True,
+    "k_anchor": "#7b2ff7", "k_harmony": "Monochrom-Ramp", "k_imgmode": "—",
+    "n_stops": len(_MATT.stops), "bg_key": _MATT.bg,
 }
-PROFILE_BG = {"Korrend": "#08060d", "Type Drift": "#1a1712",
-              "Seek": "#0d0606", "Monochrom": "#000000"}
+MIX_KEYS = {m: f"k_w_{i}" for i, m in enumerate(MODES)}
 
 
-# ----------------------------------------------------------------------
-# Palette / LUT
-# ----------------------------------------------------------------------
-def make_cmap(hex_colors):
-    return LinearSegmentedColormap.from_list("c", list(hex_colors), N=512)
+def set_state(**werte):
+    """Zustand aendern — ausschliesslich aus einem Rueckruf heraus.
+
+    Rueckrufe (on_click, on_change) laufen zwischen zwei Durchlaeufen: danach
+    baut Streamlit das Skript vollstaendig neu auf, und jedes Widget wird
+    wieder erzeugt.
+
+    Dasselbe mitten im Aufbau mit st.rerun() zu erzwingen, ist ein Fehler mit
+    weitreichenden Folgen: alle Widgets unterhalb der Abbruchstelle werden in
+    diesem Durchlauf nicht mehr erzeugt, und Streamlit verwirft ihren Zustand.
+    Ein Klick auf 'Preset laden' im Farbe-Pult setzte so stillschweigend
+    Schriftgroesse, Rasterweite und alles andere zurueck, was im Skript
+    dahinter steht — waehrend die Regler davor ihren Wert behielten.
+    """
+    st.session_state.update(werte)
 
 
-# ----------------------------------------------------------------------
-# Farbtheorie: OKLCH-Palettengenerator
-# ----------------------------------------------------------------------
-def _hex_to_rgb01(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+# ---------------------------- Rueckrufe ----------------------------
+def _cb_preset():
+    cp = PRESETS[st.session_state["k_preset"]]
+    set_state(n_stops=len(cp), bg_key=PROFILE_BG[st.session_state["k_preset"]],
+              **{f"c{i}": c for i, c in enumerate(cp)})
 
 
-def _rgb01_to_hex(rgb):
-    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in rgb)
+def _cb_inkset():
+    from sonicart.riso import ink_set as _ink
+    spez = _ink(st.session_state["k_inkset"])
+    set_state(n_stops=len(spez.inks), k_paper=spez.paper,
+              **{f"c{i}": c for i, c in enumerate(spez.inks)})
 
 
-def _srgb_lin(c):
-    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+def _cb_pair():
+    t, a, m = FONT_PAIRS[st.session_state["k_pair"]]
+    set_state(k_face_title=t, k_face_artist=a, k_face_meta=m)
 
 
-def _lin_srgb(c):
-    c = max(0.0, min(1.0, c))
-    return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+def _cb_key_palette(an):
+    k = an.key
+    neu = palette_from_key(k["tonic"], k["mode"],
+                           n=int(st.session_state["n_stops"]),
+                           harmony=st.session_state["k_harmony"],
+                           template=PRESETS[st.session_state["k_preset"]],
+                           hue_spread=0.6 + 0.8 * an.harmonic_complexity)
+    set_state(bg_key=neu[0], **{f"c{i}": c for i, c in enumerate(neu)})
 
 
-def hex_to_oklch(hx):
-    r, g, b = (_srgb_lin(v) for v in _hex_to_rgb01(hx))
-    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
-    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
-    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-    l_, m_, s_ = np.cbrt([l, m, s])
-    L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
-    a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
-    bb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-    return L, float(np.hypot(a, bb)), float(np.arctan2(bb, a))
+def _cb_anchor_palette():
+    ss = st.session_state
+    tmpl = PRESETS[ss["k_preset"]]
+    n = len(tmpl) if ss["k_harmony"] == "Profil-Struktur" else int(ss["n_stops"])
+    neu = generate_palette(ss["k_anchor"], n, ss["k_harmony"], template=tmpl)
+    set_state(n_stops=len(neu), bg_key=neu[0],
+              **{f"c{i}": c for i, c in enumerate(neu)})
 
 
-def oklch_to_hex(L, C, h):
-    a, b = C * np.cos(h), C * np.sin(h)
-    l_ = L + 0.3963377774 * a + 0.2158037573 * b
-    m_ = L - 0.1055613458 * a - 0.0638541728 * b
-    s_ = L - 0.0894841775 * a - 1.2914855480 * b
-    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
-    r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
-    g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
-    bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
-    return _rgb01_to_hex((_lin_srgb(r), _lin_srgb(g), _lin_srgb(bl)))
+def _cb_recipe(rohdaten: bytes, name: str):
+    if name.lower().endswith(".png"):
+        r = read_recipe(io.BytesIO(rohdaten))
+        if r is None:
+            st.session_state["_rezept_fehler"] = "In diesem PNG steckt kein Rezept."
+            return
+        set_state(**recipe_to_state(r))
+    else:
+        roh = json.loads(rohdaten)
+        set_state(**{k: v for k, v in roh.items()
+                     if k in DEFAULTS or k == "n_stops"
+                     or k.startswith(("c", "k_w_"))})
+    st.session_state.pop("_rezept_fehler", None)
 
 
-def generate_palette(anchor_hex, n=4, mode="Monochrom-Ramp", template=None):
-    """Erzeugt aus EINER Ankerfarbe eine stimmige Palette (dunkel -> hell)."""
-    L0, C0, h0 = hex_to_oklch(anchor_hex)
-    C0 = max(C0, 0.06)
-    deg = np.deg2rad
+def _cb_mix_saat():
+    """Beim Einschalten des Mix bekommt der gewaehlte Modus sein Gewicht.
 
-    if mode == "Profil-Struktur" and template:
-        tl = [hex_to_oklch(c) for c in template]
-        h_ref = tl[-1][2]
-        return [oklch_to_hex(L, C, h0 + (h - h_ref)) for (L, C, h) in tl]
+    Vorher stand das mitten im Aufbau und feuerte bei jedem Durchlauf neu, in
+    dem das Gewicht 0 war — man konnte die eigene Ebene also gar nicht auf 0
+    stellen, sie sprang sofort zurueck.
+    """
+    ss = st.session_state
+    if not ss.get("k_mixon"):
+        return
+    schluessel = MIX_KEYS[ss["k_mode"]]
+    if all(ss.get(k, 0) <= 0 for k in MIX_KEYS.values()) or ss.get(schluessel, 0) <= 0:
+        set_state(**{schluessel: 0.8})
 
-    Ls = np.linspace(0.12, 0.95, n)
-    chroma_env = 0.55 + 0.45 * (1 - np.abs(2 * np.linspace(0, 1, n) - 1))  # peak Mitte
-    stops = []
-    for i, L in enumerate(Ls):
-        C = C0 * chroma_env[i]
-        if mode == "Monochrom-Ramp":
-            h = h0
-        elif mode == "Analog":
-            h = h0 + deg(35) * (i / (n - 1) - 0.5) * 2
-        elif mode == "Komplementaer-Akzent":
-            h = h0 if i < n - 1 else h0 + np.pi
-            if i == n - 1:
-                C = C0
-        elif mode == "Triadisch":
-            h = [h0, h0 + 2 * np.pi / 3, h0 - 2 * np.pi / 3][i % 3]
+
+def init_state():
+    """Zustand herstellen — aus dem Spiegel, sonst aus den Vorgaben.
+
+    Zwei Eigenheiten von Streamlit werden hier aufgefangen:
+
+    1. Der Zustand jedes Widgets, das in einem Durchlauf nicht erzeugt wurde,
+       wird verworfen. Wer den Risodruck abschaltet, um zu vergleichen, und
+       wieder einschaltet, faende Papierfarbe und Rasterweite sonst auf den
+       Vorgaben vor. Der Spiegel ist ein gewoehnlicher Eintrag ohne Widget
+       und ueberlebt das.
+
+    2. Ein Widget uebernimmt einen Wert aus dem Zustand nur, wenn dieser im
+       *selben* Durchlauf gesetzt wurde, in dem das Widget zum ersten Mal
+       entsteht. Steht der Schluessel schon aus einem frueheren Durchlauf da
+       — Vorgaben vor dem Datei-Upload, Spiegel beim Wiedereinblenden,
+       geladenes Rezept —, zeigt das Widget stattdessen seinen eigenen
+       Vorgabewert und schickt diesen beim ersten Klick zurueck in den
+       Zustand. So stand nach dem Upload 'Rose gespiegelt' im Auswahlfeld,
+       waehrend das Bild im Gitter-Modus gerechnet wurde, und die Farbfelder
+       kippten beim ersten Moduswechsel auf Schwarz. Deshalb wird hier jeder
+       Wert in jedem Durchlauf neu gesetzt, auch wenn er schon dasteht.
+    """
+    spiegel = st.session_state.setdefault("_spiegel", {})
+    #  Nur was im vorigen Durchlauf ausgeblendet war, wird aus dem Spiegel
+    #  zurueckgeholt. Ein sichtbarer Regler traegt dagegen gerade die frische
+    #  Eingabe des Nutzers — die duerfte der Spiegel nicht ueberschreiben.
+    zuletzt_sichtbar = st.session_state.get("_sichtbar_letzte", ALLE_BEDINGTEN)
+    for k, v in DEFAULTS.items():
+        if k in ALLE_BEDINGTEN and k not in zuletzt_sichtbar and k in spiegel:
+            st.session_state[k] = spiegel[k]
         else:
-            h = h0
-        stops.append(oklch_to_hex(L, C, h))
-    return stops
+            st.session_state[k] = st.session_state.get(k, spiegel.get(k, v))
+    #  Sechs Farbstufen, auch wenn gerade weniger gezeigt werden: sonst hat
+    #  c3 beim Hochschalten keinen Wert und das Feld startet auf Schwarz.
+    vorrat = list(_MATT.stops) + ["#8d8a84", "#4b47a8", "#c9c2b2"]
+    for i in range(6):
+        st.session_state[f"c{i}"] = st.session_state.get(
+            f"c{i}", spiegel.get(f"c{i}", vorrat[i]))
+    #  Alle Gewichte auf 0: welche Ebene beim Einschalten des Mix hochgezogen
+    #  wird, entscheidet die Modusauswahl. Jede feste Vorbelegung wuerde sonst
+    #  eine Ebene einblenden, die niemand gewaehlt hat.
+    for key in MIX_KEYS.values():
+        st.session_state[key] = st.session_state.get(key, spiegel.get(key, 0.0))
 
 
-def cmap_from_cube(path, n=9):
-    size = None; dim = 3; data = []
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith(("#", "TITLE", "DOMAIN_")):
-                continue
-            if s.startswith("LUT_3D_SIZE"): size = int(s.split()[-1]); dim = 3; continue
-            if s.startswith("LUT_1D_SIZE"): size = int(s.split()[-1]); dim = 1; continue
-            if s.startswith("LUT_"): continue
-            p = s.split()
-            if len(p) == 3:
-                try: data.append([float(v) for v in p])
-                except ValueError: pass
-    data = np.array(data)
-    if size is None or len(data) == 0:
-        raise ValueError("Kein gueltiges .cube LUT")
-    if dim == 1:
-        ramp = data[np.linspace(0, size - 1, n).round().astype(int)]
-    else:
-        ks = np.linspace(0, size - 1, n).round().astype(int)
-        ramp = data[ks * (1 + size + size * size)]
-    return LinearSegmentedColormap.from_list("lut", np.clip(ramp, 0, 1), N=512)
-
-
-# ----------------------------------------------------------------------
-# Analyse-Helfer
-# ----------------------------------------------------------------------
-def load_audio(f, sr=22050, start=0.0, end=None):
-    if hasattr(f, "seek"):
-        f.seek(0)                                   # UploadedFile mehrfach lesbar
-    y, sr = librosa.load(f, sr=sr, mono=True)
-    a = int(start * sr); b = int(end * sr) if end else len(y)
-    return y[a:b], sr
-
-
-def mel_db(y, sr, n_mels):
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, fmax=sr / 2)
-    return librosa.power_to_db(S, ref=1.0)
-
-
-def norm01(x):
-    lo, hi = np.percentile(x, 2), x.max()
-    return np.clip((x - lo) / (hi - lo + 1e-9), 0, 1)
-
-
-def punch(x, gate, gamma):
-    return np.clip((x - gate) / (1 - gate + 1e-9), 0, 1) ** gamma
-
-
-def _polar_fig(size_px, bg, dpi=100, transparent=False, rotation=0.0):
-    inch = size_px / dpi
-    fig = plt.figure(figsize=(inch, inch), dpi=dpi)
-    face = "none" if transparent else bg
-    fig.patch.set_facecolor(face)
-    if transparent:
-        fig.patch.set_alpha(0)
-    ax = fig.add_axes([0, 0, 1, 1], projection="polar")
-    ax.set_facecolor(face); ax.axis("off")
-    ax.set_theta_offset(np.deg2rad(rotation))     # 0 = Osten; dreht die ganze Scheibe
-    ax.set_ylim(0, 1.2)
-    return fig, ax
-
-
-def cmap_to_alpha(cmap, knee=0.12):
-    """Colormap mit Alpha-Verlauf: leise -> durchsichtig, laut -> deckend."""
-    x = np.linspace(0, 1, 256)
-    cols = cmap(x)
-    cols[:, 3] = np.clip((x - knee) / (1 - knee + 1e-9), 0, 1) ** 0.8
-    return ListedColormap(cols)
-
-
-# ----------------------------------------------------------------------
-# Modi.  Gemeinsame Regler:  thickness, gate, gamma, inner
-# ----------------------------------------------------------------------
-def render_rose(y, sr, cmap, bg, size_px=3000, mirror=True,
-                thickness=1.0, gate=0.15, gamma=1.4, inner=0.15,
-                n_mels=110, data_thickness=True, transparent=False, rotation=0.0):
-    a = norm01(mel_db(y, sr, n_mels)).mean(axis=1)
-    a = a / (a.max() + 1e-9)
-    a = punch(a, gate, gamma)
-    N = len(a)
-    fig, ax = _polar_fig(size_px, bg, transparent=transparent, rotation=rotation)
-    if mirror:
-        base_w = np.pi / N
-        w = base_w * thickness * (0.4 + 1.2 * a if data_thickness else 1.0)
-        right = np.pi / 2 - np.linspace(0, np.pi, N)
-        left = np.pi / 2 + np.linspace(0, np.pi, N)
-        ax.bar(right, a, width=w, bottom=inner, color=cmap(a), lw=0)
-        ax.bar(left, a, width=w, bottom=inner, color=cmap(a), lw=0)
-    else:
-        base_w = 2 * np.pi / N
-        w = base_w * thickness * (0.4 + 1.2 * a if data_thickness else 1.0)
-        ang = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        ax.bar(ang, a, width=w, bottom=inner, color=cmap(a), lw=0)
-    return fig
-
-
-def render_hpss_time(y, sr, cmap, bg, size_px=3000,
-                     thickness=1.0, gate=0.5, gamma=1.7, inner=0.15,
-                     onset=0.25, n_mels=120, transparent=False, rotation=0.0,
-                     spoke_len=0.35):
-    yh, yp = librosa.effects.hpss(y)
-    Sh = punch(norm01(mel_db(yh, sr, n_mels)), gate, gamma)
-    Sp = norm01(mel_db(yp, sr, n_mels))
-    fig, ax = _polar_fig(size_px, bg, transparent=transparent, rotation=rotation)
-    nf, nt = Sh.shape
-    th = np.linspace(0, 2 * np.pi, nt + 1); r = np.linspace(inner, 1, nf + 1)
-    base_cmap = cmap_to_alpha(cmap) if transparent else cmap
-    ax.pcolormesh(th, r, Sh, cmap=base_cmap, shading="flat")
-    # Perkussiv-Akzent kraeftiger (niedrigere Schwelle -> mehr sichtbar)
-    acc = LinearSegmentedColormap.from_list(
-        "a", [(0.95, 0.9, 1, 0), (1.0, 0.85, 1, 1)], N=256)
-    ax.pcolormesh(th, r, np.ma.masked_less(Sp, 0.45), cmap=acc, shading="flat")
-    if onset > 0:
-        oenv = librosa.onset.onset_strength(y=y, sr=sr)
-        om = oenv.max() + 1e-9
-        outer = 1.03
-        for f in librosa.onset.onset_detect(onset_envelope=oenv, sr=sr):
-            s = oenv[f] / om
-            if s < 0.30:                               # nur markante Onsets
-                continue
-            L = spoke_len * (0.4 + 0.6 * s)            # Laenge ~ Staerke
-            ang = 2 * np.pi * f / len(oenv)
-            ax.plot([ang, ang], [outer - L, outer], color="#f4ecff",
-                    lw=(1.8 + 2.6 * s) * thickness, alpha=onset * (0.55 + 0.45 * s),
-                    solid_capstyle="round")
-    return fig
-
-
-def render_wave_ring(y, sr, cmap, bg, size_px=3000, thickness=1.0, gate=0.15,
-                     gamma=1.4, inner=0.15, n_mels=110, data_thickness=True,
-                     transparent=False, rotation=0.0, cols=1400):
-    hop = max(1, len(y) // cols)
-    env = np.array([np.abs(y[i * hop:(i + 1) * hop]).max()
-                    if y[i * hop:(i + 1) * hop].size else 0.0 for i in range(cols)])
-    env = env / (env.max() + 1e-9)
-    env = env ** gamma                              # Kontrast der Welle
-    theta = np.linspace(0, 2 * np.pi, cols, endpoint=False)
-    base = inner + 0.45
-    amp = env * 0.24 * thickness
-    th = np.append(theta, theta[0])
-    ro = np.append(base + amp, base + amp[0]); ri = np.append(base - amp, base - amp[0])
-    fig, ax = _polar_fig(size_px, bg, transparent=transparent, rotation=rotation)
-    ax.fill_between(th, ri, ro, color=cmap(0.55), alpha=0.5, lw=0)
-    for pts in (np.column_stack([th, ro]), np.column_stack([th, ri])):
-        segs = np.stack([pts[:-1], pts[1:]], axis=1)
-        ax.add_collection(LineCollection(segs, colors=cmap(th[:-1] / (2 * np.pi)),
-                                         linewidths=2.2 * thickness))
-    ax.set_ylim(0, 1.1)
-    return fig
-
-
-MODES = {
-    "Rose gespiegelt": lambda **k: render_rose(mirror=True, **k),
-    "Rose roh":        lambda **k: render_rose(mirror=False, **k),
-    "HPSS-Zeit":       render_hpss_time,
-    "Kreis-Wellenform": render_wave_ring,
+#  Regler, die nur unter einer Bedingung erscheinen. Wer ausgeblendet ist,
+#  darf nicht gespiegelt werden: Streamlit setzt solche Werte auf die Vorgabe
+#  zurueck, und ein blindes Sichern wuerde die Einstellung des Nutzers damit
+#  ueberschreiben. Der Schluessel ist der Reglername des Modus (siehe
+#  Mode.knobs), der Wert die zugehoerigen Widget-Schluessel.
+BEDINGT_MODUS = {
+    "gate": ["k_gate"], "inner": ["k_inner"], "n_mels": ["k_nmels"],
+    "turns": ["k_turns"], "stufen": ["k_stufen"], "spalten": ["k_spalten"],
+    "baender": ["k_baender"], "amp": ["k_amp"], "glaette": ["k_glaette"],
+    "onset": ["k_onset"], "spoke_len": ["k_spoke"],
+    "n_segments": ["k_nseg"], "gap_deg": ["k_gap"], "gap": ["k_gap_gitter"],
+    "whiten_amount": ["k_whiten"], "tilt": ["k_tilt"], "source": ["k_source"],
+    "symmetry": ["k_sym", "k_symauto"], "data_thickness": ["k_dthick"],
+    "label_ring": ["k_labelring"], "farbe_nach_band": ["k_bandfarbe"],
+    "mark_segments": ["k_marks"],
 }
-DEFAULT_GATE = {"Rose gespiegelt": 0.15, "Rose roh": 0.15,
-                "HPSS-Zeit": 0.5, "Kreis-Wellenform": 0.15}
+BEDINGT_SCHALTER = {
+    "k_riso_on": ["k_inkset", "k_paper", "k_cell", "k_misreg", "k_texture",
+                  "k_gain", "k_overprint", "k_invert"],
+    "k_fxon": ["k_fxint", "k_g", "k_b", "k_c", "k_vig", "k_streaks", "k_depth",
+               "k_post", "k_half", "k_seed"],
+}
+ALLE_BEDINGTEN = {k for v in BEDINGT_MODUS.values() for k in v} | \
+                 {k for v in BEDINGT_SCHALTER.values() for k in v}
+
+
+def sichtbare_regler(knobs) -> set:
+    """Welche bedingten Regler standen in diesem Durchlauf tatsaechlich da?"""
+    ss = st.session_state
+    sichtbar = set()
+    for name, keys in BEDINGT_MODUS.items():
+        if name in knobs:
+            sichtbar.update(keys)
+    for schalter, keys in BEDINGT_SCHALTER.items():
+        if ss.get(schalter):
+            sichtbar.update(keys)
+    return sichtbar
+
+
+def spiegeln(knobs=None):
+    """Am Ende des Durchlaufs sichern, was sichtbar war."""
+    spiegel = st.session_state.setdefault("_spiegel", {})
+    sichtbar = sichtbare_regler(knobs or set())
+    for k in list(DEFAULTS) + [f"c{i}" for i in range(6)] + list(MIX_KEYS.values()):
+        if k in ALLE_BEDINGTEN and k not in sichtbar:
+            continue                    # ausgeblendet -> Wert ist nicht echt
+        if k in st.session_state:
+            spiegel[k] = st.session_state[k]
+    st.session_state["_sichtbar_letzte"] = sichtbar
+
+
+def state_keys() -> list[str]:
+    n = int(st.session_state.get("n_stops", 4))
+    return list(DEFAULTS) + list(MIX_KEYS.values()) + [f"c{i}" for i in range(n)]
+
+
+def stops_from_state() -> list[str]:
+    n = int(st.session_state["n_stops"])
+    return [st.session_state.get(f"c{i}", "#ffffff") for i in range(n)]
+
+
+def recipe_from_state(an: Analysis | None, audio_name: str = "") -> Recipe:
+    ss = st.session_state
+    params = dict(DEFAULT_PARAMS)
+    sym = ss["k_sym"]
+    if ss["k_symauto"] and an is not None:
+        sym = an.meter                      # Taktart -> Zaehligkeit der Rose
+    params.update(thickness=ss["k_thick"], gate=ss["k_gate"], gamma=ss["k_gamma"],
+                  inner=ss["k_inner"], n_mels=ss["k_nmels"], rotation=ss["k_rot"],
+                  data_thickness=ss["k_dthick"], symmetry=int(sym),
+                  source=ss["k_source"], turns=ss["k_turns"], onset=ss["k_onset"],
+                  spoke_len=ss["k_spoke"], n_segments=int(ss["k_nseg"]),
+                  gap_deg=ss["k_gap"], mark_segments=ss["k_marks"],
+                  label_ring=ss["k_labelring"],
+                  whiten_amount=ss["k_whiten"], tilt=ss["k_tilt"],
+                  stufen=int(ss["k_stufen"]), gap=ss["k_gap_gitter"],
+                  spalten=int(ss["k_spalten"]), baender=int(ss["k_baender"]),
+                  amp=ss["k_amp"], glaette=ss["k_glaette"],
+                  farbe_nach_band=ss["k_bandfarbe"])
+    fx = None
+    if ss["k_fxon"]:
+        fx = dict(FX_DEFAULTS, intensity=ss["k_fxint"], grain=ss["k_g"],
+                  bloom=ss["k_b"], chroma=ss["k_c"], seed=(ss["k_seed"] or None),
+                  vignette=ss["k_vig"], streaks=ss["k_streaks"], depth=ss["k_depth"],
+                  posterize_levels=ss["k_post"], halftone=ss["k_half"])
+    riso = None
+    if ss["k_riso_on"]:
+        riso = dict(inks=stops_from_state(), paper=ss["k_paper"],
+                    cell=ss["k_cell"], misregister=ss["k_misreg"],
+                    texture=ss["k_texture"], gain=ss["k_gain"],
+                    invert=ss["k_invert"], overprint=ss["k_overprint"],
+                    seed=int(ss["k_seed"]) or 3)
+    mix = {m: ss[k] for m, k in MIX_KEYS.items()} if ss["k_mixon"] else {}
+    return Recipe(
+        mix_blend=ss["k_mixblend"],
+        mode=ss["k_mode"], mix=mix, stops=stops_from_state(), bg=ss["bg_key"],
+        params=params, effects=fx, riso=riso, layout=ss["k_layout"],
+        layout_scale=ss["k_lscale"], transparent=ss["k_transp"],
+        size=int(ss["k_size"]), audio_name=audio_name,
+        typography=dict(artist=ss["k_artist"], title=ss["k_title"],
+                        label=ss["k_label"], catalog=ss["k_catalog"],
+                        anchor=ss["k_tanchor"], size=ss["k_tsize"],
+                        tracking=ss["k_ttrack"], upper=ss["k_tupper"],
+                        color=ss["k_tcolor"], shadow=ss["k_tshadow"],
+                        margin=ss["k_tmargin"], font_path=ss.get("font_path"),
+                        face_title=ss["k_face_title"],
+                        face_artist=ss["k_face_artist"],
+                        face_meta=ss["k_face_meta"],
+                        weight_title=ss["k_wtitle"],
+                        weight_artist=ss["k_wartist"],
+                        title_upper=ss["k_titleupper"],
+                        title_tracking=ss["k_ttrack_title"],
+                        line_gap=ss["k_linegap"], max_width=ss["k_maxw"],
+                        rule=ss["k_rule"],
+                        contrast_mode=ss["k_contrast"],
+                        contrast_min=ss["k_contrastmin"]))
+
+
+def recipe_to_state(r: Recipe) -> dict:
+    """Rezept -> Widget-Zustand (Gegenrichtung zu recipe_from_state).
+
+    Gibt ein dict zurueck, statt selbst zu schreiben: so laesst es sich ueber
+    set_state einspielen und ausserdem ohne Streamlit-Kontext testen.
+    """
+    p = dict(DEFAULT_PARAMS)
+    p.update(r.params or {})
+    ss = {}
+    ss.update({
+        "k_mode": r.mode, "k_mixon": bool(r.mix), "bg_key": r.bg,
+        "n_stops": len(r.stops), "k_layout": r.layout, "k_lscale": r.layout_scale,
+        "k_transp": r.transparent, "k_size": r.size,
+        "k_thick": p["thickness"], "k_gate": p["gate"], "k_gamma": p["gamma"],
+        "k_inner": p["inner"], "k_nmels": p["n_mels"], "k_rot": p["rotation"],
+        "k_dthick": p["data_thickness"], "k_sym": p["symmetry"],
+        "k_source": p["source"], "k_turns": p["turns"], "k_onset": p["onset"],
+        "k_spoke": p["spoke_len"], "k_nseg": p["n_segments"],
+        "k_gap": p["gap_deg"], "k_marks": p["mark_segments"],
+        "k_labelring": p["label_ring"], "k_fxon": bool(r.effects),
+        "k_whiten": p["whiten_amount"], "k_tilt": p["tilt"],
+        "k_stufen": p["stufen"], "k_gap_gitter": p["gap"],
+        "k_spalten": p["spalten"], "k_baender": p["baender"],
+        "k_amp": p["amp"], "k_glaette": p["glaette"],
+        "k_bandfarbe": p["farbe_nach_band"],
+        "k_riso_on": bool(r.riso), "k_mixblend": r.mix_blend,
+    })
+    if r.riso:
+        d = RisoSpec.from_dict(r.riso)
+        ss.update({"k_paper": d.paper, "k_cell": d.cell,
+                   "k_misreg": d.misregister, "k_texture": d.texture,
+                   "k_gain": d.gain, "k_invert": d.invert,
+                   "k_overprint": d.overprint})
+        #  Ein Rezept mit Druckschicht, aber ohne Effekte haette den Seed
+        #  sonst verloren — er steuert beide.
+        ss.setdefault("k_seed", d.seed if d.seed != 3 else 0)
+    for i, c in enumerate(r.stops):
+        ss[f"c{i}"] = c
+    for m, key in MIX_KEYS.items():
+        ss[key] = (r.mix or {}).get(m, 0.0)
+    if r.effects:
+        fx = dict(FX_DEFAULTS, **r.effects)
+        ss.update({"k_fxint": fx["intensity"], "k_g": fx["grain"],
+                   "k_b": fx["bloom"], "k_c": fx["chroma"],
+                   "k_seed": fx["seed"] or 0, "k_vig": fx["vignette"],
+                   "k_streaks": fx["streaks"], "k_depth": fx["depth"],
+                   "k_post": fx["posterize_levels"], "k_half": fx["halftone"]})
+    t = r.typography or {}
+    ss.update({"k_artist": t.get("artist", ""), "k_title": t.get("title", ""),
+               "k_label": t.get("label", ""), "k_catalog": t.get("catalog", ""),
+               "k_tanchor": t.get("anchor", "unten links"),
+               "k_tsize": t.get("size", 0.052), "k_ttrack": t.get("tracking", 0.0),
+               "k_tupper": t.get("upper", False),
+               "k_tcolor": t.get("color", "#ffffff"),
+               "k_tshadow": t.get("shadow", 0.0),
+               "k_tmargin": t.get("margin", 0.07),
+               "k_face_title": t.get("face_title", "Bebas Neue"),
+               "k_face_artist": t.get("face_artist", "Space Grotesk"),
+               "k_face_meta": t.get("face_meta", "Space Mono"),
+               "k_wtitle": t.get("weight_title", ""),
+               "k_wartist": t.get("weight_artist", "Medium"),
+               "k_titleupper": t.get("title_upper", True),
+               "k_ttrack_title": t.get("title_tracking", 0.04),
+               "k_linegap": t.get("line_gap", 0.38),
+               "k_maxw": t.get("max_width", 0.86),
+               "k_rule": t.get("rule", 0.0),
+               "k_contrast": t.get("contrast_mode", "Farbe umschalten"),
+               "k_contrastmin": t.get("contrast_min", 4.5)})
+    return ss
 
 
 # ----------------------------------------------------------------------
-# Compositing
+# Seitenleiste — nur, was die Sitzung eroeffnet und ueberall gilt
 # ----------------------------------------------------------------------
-def fig_to_pil(fig, size_px, transparent=False):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", transparent=transparent,
-                facecolor="none" if transparent else fig.get_facecolor())
-    plt.close(fig); buf.seek(0)
-    mode = "RGBA" if transparent else "RGB"
-    return Image.open(buf).convert(mode).resize((size_px, size_px), Image.LANCZOS)
+def sidebar():
+    """Quelle, Rezept, Anzeige. Mehr nicht.
+
+    Vorher standen hier alle 96 Bedienelemente in einer 5200 px langen
+    Spalte — man sah nie mehr als ein Zwanzigstel davon und musste zum
+    Vergleichen scrollen. Die Regler sitzen jetzt im Steuerpult neben der
+    Vorschau, wo man ihre Wirkung sieht.
+    """
+    ss = st.session_state
+    with st.sidebar:
+        st.markdown("### Sonic Artwork")
+        up = st.file_uploader("Audiodatei",
+                              type=["wav", "mp3", "flac", "ogg", "m4a", "aif", "aiff"])
+        an = None
+        if up is not None:
+            try:
+                with st.spinner("Analysiere (einmal pro Datei) ..."):
+                    an = get_analysis(up.getvalue(), up.name)
+                    an.summary()
+            except Exception as e:
+                st.error(f"Audio konnte nicht gelesen werden: {e}")
+
+        st.divider()
+        st.checkbox("Live-Vorschau", key="k_live",
+                    help="Aus, wenn das Rechnen bei jedem Regler stoert.")
+        st.selectbox("Sperrflaechen", list(SAFE_AREAS), key="k_safe",
+                     help="Richtwerte fuer Player-Bedienelemente. "
+                          "Nur Vorschau, nie im Export.")
+
+        with st.expander("Rezept"):
+            st.caption("Jedes exportierte PNG traegt sein Rezept im Dateikopf — "
+                       "ein altes Cover hier hochladen stellt alles wieder her.")
+            rfile = st.file_uploader("Rezept (.json) oder Cover (.png)",
+                                     type=["json", "png"], key="k_loadfile")
+            if rfile is not None:
+                st.button("Anwenden", width="stretch", key="b_apply",
+                          on_click=_cb_recipe,
+                          args=(rfile.getvalue(), rfile.name))
+            if ss.get("_rezept_fehler"):
+                st.error(ss["_rezept_fehler"])
+            cfg = {k: ss[k] for k in state_keys() if k in ss}
+            st.download_button("Speichern (.json)", json.dumps(cfg, indent=2),
+                               "rezept.json", "application/json",
+                               width="stretch")
+
+        with st.expander("Eigene Dateien"):
+            lut = st.file_uploader("LUT statt Palette (.cube)", type=["cube"])
+            img_up = st.file_uploader("Bild oder Textur", type=["png", "jpg", "jpeg"])
+            st.selectbox("Einsatz des Bildes", IMAGE_MODES, key="k_imgmode",
+                         help="Masking = Bild NUR innerhalb der Audio-Form. "
+                              "Textur-Blend = Textur faerbt die Form.")
+            signet_up = st.file_uploader("Signet (PNG)", type=["png"])
+            font_up = st.file_uploader("Eigene Schrift (TTF/OTF)",
+                                       type=["ttf", "otf"])
+            if font_up is not None:
+                fp = tempfile.NamedTemporaryFile(
+                    suffix=os.path.splitext(font_up.name)[1], delete=False)
+                fp.write(font_up.getvalue())
+                fp.close()
+                ss["font_path"] = fp.name
+            if ss.get("font_path"):
+                st.caption("Eigene Schrift aktiv — sie ueberschreibt alle Rollen.")
+                st.button("Verwerfen", width="stretch", key="b_font_weg",
+                          on_click=set_state, kwargs={"font_path": None})
+
+        st.caption("Ohne Browser: `python -m sonicart --help`")
+    return up, an, lut, img_up, signet_up
 
 
-def _hex_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+# ----------------------------------------------------------------------
+# Analyse als eine Zeile statt als sechs grosse Zahlen
+# ----------------------------------------------------------------------
+def analyse_zeile(an: Analysis):
+    s = an.summary()
+    chips = [
+        ("Tempo", f"{s['tempo_bpm']:.0f} bpm"),
+        ("Tonart", f"{s['tonart']} ({s['tonart_sicherheit']:.0%})"),
+        ("Takt", s["taktart"]),
+        ("Abschnitte", str(s["abschnitte"])),
+        ("Harmonik", f"{s['harmonische_komplexitaet']:.2f}"),
+        ("Stereo", "ja" if s["stereo"] else "mono"),
+        ("Dauer", f"{s['dauer_s']:.0f} s"),
+    ]
+    html = "".join(
+        f'<span style="display:inline-block;margin:0 14px 0 0;font:12px/1.6 '
+        f'system-ui,sans-serif"><span style="opacity:.55">{k}</span> '
+        f'<strong>{v}</strong></span>' for k, v in chips)
+    st.markdown(f'<div style="padding:2px 0 10px">{html}</div>',
+                unsafe_allow_html=True)
 
 
-def _render_mode_pil(y, sr, mode, cmap, bg, size_px, params, transparent=False):
-    p = dict(params); p["transparent"] = transparent
-    fig = MODES[mode](y=y, sr=sr, cmap=cmap, bg=bg, size_px=size_px, **p)
-    return fig_to_pil(fig, size_px, transparent=transparent)
+def _zeige_kontrast(b: dict):
+    """Kontrastbefund des Textsatzes anzeigen.
 
-
-def _mode_params(mode, base_params):
-    p = dict(base_params)
-    if mode == "HPSS-Zeit":
-        p.pop("data_thickness", None)
-        p.setdefault("onset", 0.2)
-        p["gate"] = max(p.get("gate", 0.5), 0.4)   # HPSS braucht hoeheres Gate
+    Die Zahl ist der WCAG-Kontrast zwischen Textfarbe und dem tatsaechlich
+    gemessenen Untergrund unter der schwaechsten Zeile — nicht gegen die
+    eingestellte Hintergrundfarbe, die unter einem Raster oder einer Form gar
+    nicht sichtbar sein muss.
+    """
+    grund = "#%02x%02x%02x" % tuple(b["grund"])
+    zeile = f" · schwaechste Zeile {b['zeile']!r}" if b.get("zeile") else ""
+    text = (f"Textkontrast {b['kontrast']:.1f}:1 gegen {grund} "
+            f"(Minimum {b['minimum']:.1f}){zeile}")
+    if b.get("platte"):
+        text += f" · Feld {b['platte']} unterlegt"
+    elif b.get("geaendert"):
+        text += f" · Farbe auf {b['farbe']} umgeschaltet"
+    if b["ok"]:
+        st.caption("✓ " + text)
+    elif b["modus"] == "Aus":
+        st.caption("⚠ " + text + " — Pruefung ist aus")
+    elif b["modus"] == "Farbe umschalten":
+        st.warning(text + " — keine Farbe reicht hier aus. "
+                          "'Feld unterlegen' oder eine andere Stelle waehlen.")
     else:
-        p.pop("onset", None)
-        p.setdefault("data_thickness", True)
-    return p
-
-
-def mix_modes(y, sr, weights, cmap, bg, size_px, base_params, transparent=False):
-    """Lighten-Komposit mehrerer Modi. weights: {mode: 0..1}."""
-    active = [(m, w) for m, w in weights.items() if w > 0]
-    if transparent:
-        out_rgb = np.zeros((size_px, size_px, 3))
-        out_a = np.zeros((size_px, size_px, 1))
-        for mode, w in active:
-            img = _render_mode_pil(y, sr, mode, cmap, bg, size_px,
-                                   _mode_params(mode, base_params), transparent=True)
-            arr = np.asarray(img).astype(float) / 255.0
-            rgb, a = arr[..., :3], arr[..., 3:] * w
-            out_rgb = np.maximum(out_rgb, rgb * a)     # praemultipliziertes Lighten
-            out_a = np.maximum(out_a, a)
-        rgb = np.where(out_a > 1e-6, out_rgb / np.clip(out_a, 1e-6, 1), 0)
-        rgba = np.concatenate([rgb, out_a], axis=2)
-        return Image.fromarray(np.clip(rgba * 255, 0, 255).astype("uint8"), "RGBA")
-
-    bg_arr = np.array(_hex_rgb(bg)) / 255.0
-    out = None
-    for mode, w in active:
-        img = _render_mode_pil(y, sr, mode, cmap, bg, size_px,
-                               _mode_params(mode, base_params))
-        la = np.asarray(img).astype(float) / 255.0
-        lw = bg_arr + w * (la - bg_arr)
-        out = lw if out is None else np.maximum(out, lw)
-    if out is None:
-        out = np.tile(bg_arr, (size_px, size_px, 1))
-    return Image.fromarray(np.clip(out * 255, 0, 255).astype("uint8"))
-
-
-def add_signet(img, path, scale=0.16, margin=0.06):
-    sig = Image.open(path).convert("RGBA")
-    w = int(img.width * scale)
-    sig = sig.resize((w, int(w * sig.height / sig.width)), Image.LANCZOS)
-    m = int(img.width * margin)
-    was_rgba = img.mode == "RGBA"
-    base = img.convert("RGBA")
-    base.alpha_composite(sig, (img.width - sig.width - m, img.height - sig.height - m))
-    return base if was_rgba else base.convert("RGB")
-
-
-def add_title(img, text, color, font_path=None, scale=0.05, margin=0.07):
-    d = ImageDraw.Draw(img); fs = int(img.width * scale)
-    try:
-        font = ImageFont.truetype(font_path, fs) if font_path else ImageFont.load_default(fs)
-    except Exception:
-        font = ImageFont.load_default(fs)
-    m = int(img.width * margin)
-    bb = d.textbbox((0, 0), text, font=font)
-    d.text((m, img.height - (bb[3] - bb[1]) - m - bb[1]), text, fill=color, font=font)
-    return img
+        st.warning(text + " — auch ein Feld reicht nicht. Andere Stelle waehlen.")
 
 
 # ----------------------------------------------------------------------
-# Audio-reaktive Effekte (alpha-bewusst)
+# Steuerpult: Regler dort, wo man ihre Wirkung sieht
 # ----------------------------------------------------------------------
-def features(y, sr):
-    """Timbre-Features -> 0..1. Skalierung heuristisch, ggf. kalibrieren."""
-    flat = librosa.feature.spectral_flatness(y=y).mean()
-    zcr = librosa.feature.zero_crossing_rate(y).mean()
-    cen = librosa.feature.spectral_centroid(y=y, sr=sr).mean()
-    bw = librosa.feature.spectral_bandwidth(y=y, sr=sr).mean()
-    rms = librosa.feature.rms(y=y).mean()
-    return dict(
-        roughness=float(np.clip(flat * 6 + zcr * 2, 0, 1)),    # Verzerrung -> Grain
-        energy=float(np.clip(rms * 4, 0, 1)),                  # Lautheit -> Bloom
-        brightness=float(np.clip(cen / (sr / 2) * 3, 0, 1)),
-        spread=float(np.clip(bw / (sr / 2) * 3, 0, 1)),        # Breite -> Aberration
+def _paare(*regler):
+    """Regler paarweise nebeneinander setzen.
+
+    Feste Spalten taugen hier nicht: welche Regler ueberhaupt erscheinen,
+    haengt vom Modus ab, und ein weggelassener reisst sonst ein Loch ins
+    Raster. Hier werden erst die tatsaechlich vorhandenen gesammelt und dann
+    zu zweit gesetzt.
+    """
+    aktive = [f for f in regler if f]
+    for i in range(0, len(aktive), 2):
+        spalten = st.columns(2)
+        for spalte, fn in zip(spalten, aktive[i:i + 2]):
+            with spalte:
+                fn()
+
+
+def _panel_form(an, mode, mix_on, knobs):
+    ss = st.session_state
+    st.selectbox("Bildmodus", list(MODES), key="k_mode",
+                 on_change=_cb_mix_saat)
+    st.caption(MODES[mode].hint)
+    if MODES[mode].stereo and an is not None and not an.is_stereo:
+        st.warning("Mono-Datei: gezeigt wird die Hilbert-Phase als Ersatzachse.")
+    if not MODES[mode].time_aware:
+        st.caption("Dieser Modus mittelt ueber die Zeit. Fuer den Verlauf "
+                   "'Spirale', 'Segmente' oder 'Gitter'.")
+
+    hat = lambda n: n in knobs
+    _paare(
+        lambda: st.slider("Dicke", 0.3, 3.0, step=0.1, key="k_thick"),
+        lambda: st.slider("Gamma (Kontrast)", 0.8, 2.5, step=0.1, key="k_gamma"),
+        hat("gate") and (lambda: st.slider("Gate (Rauschen)", 0.0, 0.8,
+                                           step=0.05, key="k_gate")),
+        lambda: st.slider("Winkel (Grad)", 0, 360, step=5, key="k_rot"),
+        # die Regler, die diesen Modus ausmachen
+        hat("turns") and (lambda: st.slider("Windungen", 1.0, 14.0, step=0.5,
+                                            key="k_turns")),
+        hat("stufen") and (lambda: st.slider("Tonwertstufen", 2, 9, key="k_stufen")),
+        hat("spalten") and (lambda: st.slider("Spalten (0 = quadratisch)", 0, 16,
+                                              key="k_spalten")),
+        hat("baender") and (lambda: st.slider(
+            "Schichten", 3, 14, key="k_baender",
+            help="Ueber etwa zehn verschwimmt es zu Moire.")),
+        hat("amp") and (lambda: st.slider("Ausschlag", 0.2, 1.5, step=0.05,
+                                          key="k_amp")),
+        hat("onset") and (lambda: st.slider("Onset-Akzent", 0.0, 1.0, step=0.05,
+                                            key="k_onset")),
+        hat("spoke_len") and (lambda: st.slider("Speichen-Laenge", 0.1, 1.0,
+                                                step=0.05, key="k_spoke")),
     )
 
+    with st.expander("Feinschliff"):
+        _paare(
+            hat("inner") and (lambda: st.slider("Innenradius", 0.0, 0.4,
+                                                step=0.01, key="k_inner")),
+            hat("n_mels") and (lambda: st.slider("Frequenzbaender", 60, 256,
+                                                 step=2, key="k_nmels")),
+            hat("whiten_amount") and (lambda: st.slider(
+                "Bandnormierung", 0.0, 1.0, step=0.05, key="k_whiten",
+                help="Hebt leise Frequenzbaender auf denselben Dynamikbereich. "
+                     "Ohne das frisst der Bass alles.")),
+            hat("tilt") and (lambda: st.slider(
+                "Hoehenanhebung", 0.0, 1.0, step=0.05, key="k_tilt",
+                help="Die Rose zeigt das zeitgemittelte Spektrum. "
+                     "Bandnormierung waere hier falsch — sie wuerde genau "
+                     "dieses Mittel einebnen.")),
+            hat("source") and (lambda: st.selectbox(
+                "Signalquelle", ["mix", "harmonic", "percussive"], key="k_source",
+                help="harmonic = Toene ohne Schlagzeug, "
+                     "percussive = nur die Transienten")),
+            hat("symmetry") and (lambda: st.slider(
+                "Zaehligkeit", 1, 8, key="k_sym", disabled=ss["k_symauto"])),
+            hat("n_segments") and (lambda: st.slider("Abschnitte (0 = auto)",
+                                                     0, 12, key="k_nseg")),
+            hat("gap_deg") and (lambda: st.slider("Sektorabstand (Grad)", 0.0,
+                                                  8.0, step=0.5, key="k_gap")),
+            hat("gap") and (lambda: st.slider("Feldabstand", 0.0, 0.25,
+                                              step=0.005, key="k_gap_gitter")),
+            hat("glaette") and (lambda: st.slider("Glaettung (0 = auto)", 0.0,
+                                                  40.0, step=1.0, key="k_glaette")),
+        )
+        schalter = [f for f in (
+            hat("symmetry") and (lambda: st.checkbox(
+                "Zaehligkeit aus der Taktart", key="k_symauto",
+                help=(f"Erkannt: {an.meter}/4" if an else
+                      "3/4 wird dreizaehlig, 4/4 vierzaehlig"))),
+            hat("data_thickness") and (lambda: st.checkbox(
+                "Dicke datengetrieben", key="k_dthick")),
+            hat("label_ring") and (lambda: st.checkbox("Kennband aussen",
+                                                       key="k_labelring")),
+            hat("farbe_nach_band") and (lambda: st.checkbox("Farbe nach Band",
+                                                            key="k_bandfarbe")),
+            hat("mark_segments") and (lambda: st.checkbox(
+                "Abschnittsgrenzen markieren", key="k_marks")),
+        ) if f]
+        for i in range(0, len(schalter), 2):
+            for sp, fn in zip(st.columns(2), schalter[i:i + 2]):
+                with sp:
+                    fn()
 
-def _split(img):
-    arr = np.asarray(img).astype(float)
-    return (arr[..., :3], arr[..., 3:4]) if arr.shape[2] == 4 else (arr, None)
-
-
-def _merge(rgb, a):
-    rgb = np.clip(rgb, 0, 255)
-    if a is None:
-        return Image.fromarray(rgb.astype("uint8"), "RGB")
-    return Image.fromarray(np.concatenate([rgb, np.clip(a, 0, 255)], 2).astype("uint8"), "RGBA")
-
-
-def add_grain(img, amount, seed=None, cell_ref=2.2):
-    if amount <= 0:
-        return img
-    rgb, a = _split(img)
-    H, W = rgb.shape[:2]
-    scale = W / 1000.0
-    cell = max(1, int(round(cell_ref * scale)))          # Korngroesse ~ konstant relativ
-    rng = np.random.default_rng(seed)
-    sh, sw = -(-H // cell), -(-W // cell)                # Aufrunden -> deckt Bild ab
-    small = rng.standard_normal((sh, sw))
-    noise = np.kron(small, np.ones((cell, cell)))[:H, :W, None] * 255 * amount * 0.42
-    lum = rgb.mean(2, keepdims=True) / 255.0
-    mask = 0.15 + 0.85 * lum
-    if a is not None:
-        mask = mask * (a / 255.0)                        # kein Grain auf Transparenz
-    return _merge(rgb + noise * mask, a)
-
-
-def add_bloom(img, amount):
-    if amount <= 0:
-        return img
-    rgb, a = _split(img)
-    lum = rgb.mean(2)
-    thr = np.percentile(lum, 85)
-    m = np.clip((lum - thr) / (255 - thr + 1e-9), 0, 1)
-    bright = (rgb * m[..., None]).astype("uint8")
-    rad = (6 + 22 * amount) * (rgb.shape[1] / 1000.0)      # aufloesungsrelativ
-    blur = np.asarray(Image.fromarray(bright).filter(
-        ImageFilter.GaussianBlur(radius=rad))).astype(float)
-    rgb = 255 - (255 - rgb) * (255 - blur * amount) / 255.0     # Screen
-    if a is not None:
-        amask = np.asarray(Image.fromarray((m * 255).astype("uint8")).filter(
-            ImageFilter.GaussianBlur(radius=rad))).astype(float)[..., None]
-        a = np.maximum(a, amask * amount)                        # Halo erweitert Alpha
-    return _merge(rgb, a)
-
-
-def chroma_ab(img, px):
-    if px <= 0:
-        return img
-    rgb, a = _split(img)
-    r = np.roll(rgb[:, :, 0], px, 1); b = np.roll(rgb[:, :, 2], -px, 1)
-    return _merge(np.stack([r, rgb[:, :, 1], b], 2), a)
-
-
-def add_vignette(img, amount):
-    if amount <= 0:
-        return img
-    rgb, a = _split(img); H, W = rgb.shape[:2]
-    yy, xx = np.mgrid[0:H, 0:W]
-    cx, cy = W / 2, H / 2
-    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / np.sqrt(cx ** 2 + cy ** 2)
-    v = 1 - amount * np.clip((r - 0.4) / 0.6, 0, 1) ** 2
-    return _merge(rgb * v[..., None], a)
-
-
-def posterize(img, levels):
-    if levels < 2:
-        return img
-    rgb, a = _split(img)
-    q = np.round(rgb / 255 * (levels - 1)) / (levels - 1) * 255
-    return _merge(q, a)
+    #  Fester Text: ein wechselndes Label gibt dem Aufklapper eine neue
+    #  Identitaet, und er faellt bei jeder Aenderung wieder zu.
+    with st.expander("Modi mischen"):
+        st.checkbox("Modi mischen", key="k_mixon", on_change=_cb_mix_saat)
+        if mix_on:
+            st.caption("Die Modusauswahl oben zaehlt jetzt ueber ihr Gewicht.")
+            st.selectbox("Verfahren", MIX_BLENDS, key="k_mixblend",
+                         help="Ueberlagern malt die Ebenen der Reihe nach "
+                              "uebereinander. Aufhellen nimmt je Pixel den "
+                              "helleren Wert — dabei schluckt eine "
+                              "flaechenfuellende Ebene die duenneren.")
+            m1, m2 = st.columns(2)
+            for i, (m, key) in enumerate(MIX_KEYS.items()):
+                (m1 if i % 2 == 0 else m2).slider(m, 0.0, 1.0, step=0.05, key=key)
+            aktiv = [m for m, k in MIX_KEYS.items() if ss[k] > 0]
+            voll = [m for m in aktiv if MODES[m].full_bleed]
+            if voll and len(aktiv) > 1 and ss["k_mixblend"] == "Aufhellen":
+                st.warning(f"{voll[0]} fuellt die ganze Flaeche und ueberdeckt "
+                           "beim Aufhellen die duenneren Ebenen. "
+                           "'Ueberlagern' hilft.")
 
 
-def add_halftone(img, cell, bg):
-    if cell < 2:
-        return img
-    rgb, a = _split(img); H, W = rgb.shape[:2]
-    yy, xx = np.mgrid[0:H, 0:W]
-    dx = (xx % cell) / cell - 0.5; dy = (yy % cell) / cell - 0.5
-    d = np.sqrt(dx ** 2 + dy ** 2) / 0.707
-    dot = (rgb.mean(2) / 255.0) > d           # heller -> groesserer Punkt
-    m = dot[..., None]
-    out = np.where(m, rgb, np.array(_hex_rgb(bg)))
-    if a is not None:
-        a = np.where(m, a, 0)
-    return _merge(out, a)
+def _panel_farbe(an):
+    ss = st.session_state
+    c1, c2 = st.columns([2, 1])
+    preset = c1.selectbox("Preset", list(PRESETS), key="k_preset")
+    c2.button("Laden", width="stretch", key="b_preset", on_click=_cb_preset)
+
+    st.slider("Farbstufen", 2, 6, key="n_stops")
+    n = int(ss["n_stops"])
+    #  Immer sechs gleich breite Zellen, davon n belegt. st.columns(n) wuerde
+    #  die Felder ueber die volle Breite verteilen: bei zwei Farbstufen stuenden
+    #  sie ein Viertel der Panelbreite auseinander und schwebten im Leeren.
+    MAX_STUFEN = 6
+    cols = st.columns(MAX_STUFEN)
+    for i in range(n):
+        ss.setdefault(f"c{i}", "#ffffff")
+        cols[i].color_picker(f"{i+1}", key=f"c{i}")
+    b1, b2 = st.columns([1, MAX_STUFEN - 1])
+    b1.color_picker("Grund", key="bg_key")
+    b2.caption("Die Farbstufen bilden den Verlauf von dunkel nach hell. "
+               "Beim Risodruck sind sie zugleich die Druckfarben.")
+
+    st.divider()
+    st.caption("Palette aus dem Stueck ableiten")
+    a1, a2 = st.columns(2)
+    a1.button("Aus Tonart", width="stretch", disabled=an is None, key="b_key",
+              help="Quintenzirkel -> Farbton, Moll dunkler, "
+                   "harmonische Dichte -> Farbtonspreizung",
+              on_click=_cb_key_palette, args=(an,))
+    a2.button("Aus Ankerfarbe", width="stretch", key="b_anchor",
+              on_click=_cb_anchor_palette)
+    b1, b2 = st.columns(2)
+    b1.color_picker("Ankerfarbe", key="k_anchor")
+    b2.selectbox("Harmonie", HARMONIES, key="k_harmony")
+    st.caption("Profil-Struktur = Helligkeits- und Saettigungsverlauf des "
+               "Presets uebernehmen, nur den Farbton tauschen.")
 
 
-def add_streaks(img, amount):
-    if amount <= 0:
-        return img
-    from scipy.ndimage import uniform_filter1d
-    rgb, a = _split(img); W = rgb.shape[1]
-    lum = rgb.mean(2)
-    thr = np.percentile(lum, 88)
-    mask = np.clip((lum - thr) / (255 - thr + 1e-9), 0, 1)
-    bright = rgb * mask[..., None]
-    k = int(W * 0.16 * amount) + 3
-    streak = uniform_filter1d(bright, size=k, axis=1, mode="constant")
-    out = 255 - (255 - rgb) * (255 - streak * 1.6) / 255      # Screen
-    if a is not None:
-        am = uniform_filter1d(mask * 255, size=k, axis=1, mode="constant")[..., None]
-        a = np.maximum(a, am * amount)
-    return _merge(out, a)
+def _panel_druck():
+    ss = st.session_state
+    st.checkbox("Als Risodruck ausgeben", key="k_riso_on",
+                help="Flache Farben, Halbtonraster je Platte, Passerversatz, "
+                     "Papier statt Schwarz. Gilt fuer jeden Modus.")
+    if not ss["k_riso_on"]:
+        st.caption("Aus — das Bild wird als Leuchten auf Farbe ausgegeben.")
+        return
+    c1, c2 = st.columns([2, 1])
+    c1.selectbox("Farbsatz", list(INK_SETS), key="k_inkset")
+    c2.button("Laden", width="stretch", key="b_ink", on_click=_cb_inkset)
+    st.caption("Die Druckfarben sind die Farbstufen aus 'Farbe' — "
+               "hellste zuerst, dunkelste zuletzt.")
+    d1, d2 = st.columns(2)
+    d1.color_picker("Papier", key="k_paper")
+    d2.slider("Rasterweite (px)", 2.0, 14.0, step=0.5, key="k_cell")
+    e1, e2 = st.columns(2)
+    e1.slider("Passerversatz", 0.0, 5.0, step=0.25, key="k_misreg",
+              help="0 = perfekter Passer. Der leichte Versatz ist das, was "
+                   "einen Risodruck ausmacht.")
+    e2.slider("Papierfaser", 0.0, 0.25, step=0.01, key="k_texture")
+    with st.expander("Feinschliff"):
+        f1, f2 = st.columns(2)
+        f1.slider("Tonwertzunahme", 0.5, 2.0, step=0.05, key="k_gain")
+        f2.selectbox("Ueberdruck", ["auto", "multiply", "screen"],
+                     key="k_overprint",
+                     help="auto waehlt nach Papierhelligkeit. Auf dunklem "
+                          "Papier deckt man auf (screen), statt zu lasieren.")
+        st.checkbox("Tonwerte tauschen", key="k_invert")
+    st.caption("SVG kennt keine Druckschicht — der Vektorexport gibt die "
+               "reine Form aus.")
 
 
-def add_depth(img, amount):
-    if amount <= 0:
-        return img
-    rgb, a = _split(img); H, W = rgb.shape[:2]
-    rad = 8 * W / 1000 * amount
-    blur = np.asarray(Image.fromarray(np.clip(rgb, 0, 255).astype("uint8"))
-                      .filter(ImageFilter.GaussianBlur(radius=rad))).astype(float)
-    yy, xx = np.mgrid[0:H, 0:W]
-    r = np.sqrt((xx - W / 2) ** 2 + (yy - H / 2) ** 2) / np.sqrt((W / 2) ** 2 + (H / 2) ** 2)
-    w = (np.clip((r - 0.5) / 0.5, 0, 1) ** 1.5 * amount)[..., None]   # Raender unscharf
-    return _merge(rgb * (1 - w) + blur * w, a)
+def _panel_text():
+    ss = st.session_state
+    c1, c2 = st.columns(2)
+    c1.text_input("Artist", key="k_artist")
+    c2.text_input("Titel", key="k_title")
+    c3, c4 = st.columns(2)
+    c3.text_input("Label", key="k_label")
+    c4.text_input("Katalognr.", key="k_catalog")
+
+    p1, p2 = st.columns([2, 1])
+    p1.selectbox("Schriftpaarung", list(FONT_PAIRS), key="k_pair")
+    p2.button("Setzen", width="stretch", key="b_pair", on_click=_cb_pair)
+
+    g1, g2 = st.columns(2)
+    g1.selectbox("Ankerpunkt", list(ANCHORS), key="k_tanchor")
+    g2.slider("Schriftgroesse", 0.02, 0.14, step=0.002, key="k_tsize")
+
+    st.selectbox("Kontrastpruefung", CONTRAST_MODES, key="k_contrast",
+                 help="Gemessen wird der tatsaechliche Untergrund unter jeder "
+                      "Zeile, nicht die eingestellte Hintergrundfarbe.")
+
+    with st.expander("Schriften"):
+        st.caption("Mitgeliefert unter SIL OFL — siehe sonicart/fonts/.")
+        st.selectbox("Titel", available_faces(), key="k_face_title")
+        tf = TYPEFACES.get(ss["k_face_title"])
+        if tf:
+            st.caption(tf.note)
+            if tf.weights:
+                st.select_slider("Schnitt Titel", ["", *tf.weights], key="k_wtitle")
+        st.selectbox("Artist", available_faces(), key="k_face_artist")
+        tfa = TYPEFACES.get(ss["k_face_artist"])
+        if tfa and tfa.weights:
+            st.select_slider("Schnitt Artist", ["", *tfa.weights], key="k_wartist")
+        st.selectbox("Label und Katalognummer", available_faces(),
+                     key="k_face_meta")
+
+    with st.expander("Satz"):
+        s1, s2 = st.columns(2)
+        with s1:
+            st.slider("Blockbreite", 0.3, 1.0, step=0.02, key="k_maxw",
+                      help="Zu breite Zeilen werden automatisch verkleinert.")
+            st.slider("Laufweite", -0.05, 0.35, step=0.01, key="k_ttrack")
+            st.slider("Laufweite Titel", -0.05, 0.35, step=0.01,
+                      key="k_ttrack_title")
+            st.slider("Zeilenabstand", 0.0, 1.2, step=0.02, key="k_linegap")
+        with s2:
+            st.slider("Randabstand", 0.02, 0.20, step=0.01, key="k_tmargin")
+            st.slider("Haarlinie", 0.0, 3.0, step=0.1, key="k_rule")
+            st.slider("Schatten", 0.0, 1.0, step=0.05, key="k_tshadow")
+            st.slider("Mindestkontrast", 1.5, 10.0, step=0.5, key="k_contrastmin",
+                      help="WCAG: 4.5 fuer Fliesstext, 3.0 fuer grosse Schrift.")
+        u1, u2, u3 = st.columns(3)
+        u1.checkbox("Versalien", key="k_tupper")
+        u2.checkbox("Titel gross", key="k_titleupper")
+        u3.color_picker("Farbe", key="k_tcolor")
 
 
-def apply_image(art, image, mode, bg, transparent=False):
-    """Masking = Bild NUR innerhalb der Audio-Form; Textur-Blend = Form x Textur."""
-    W = art.width
-    im = np.asarray(ImageOps.fit(image.convert("RGB"), (W, W),
-                                 method=Image.LANCZOS)).astype(float)
-    ar = np.asarray(art).astype(float)
-    lum = (ar[..., 3] / 255.0 if ar.shape[2] == 4 else ar[..., :3].mean(2) / 255.0)
-    lum = np.clip(lum, 0, 1)
-    bg_rgb = np.array(_hex_rgb(bg))
-
-    if mode == "Masking":
-        if transparent:
-            out = np.concatenate([im, (lum * 255)[..., None]], 2)
-            return Image.fromarray(np.clip(out, 0, 255).astype("uint8"), "RGBA")
-        m = lum[..., None]
-        return Image.fromarray(np.clip(im * m + bg_rgb * (1 - m), 0, 255).astype("uint8"), "RGB")
-
-    art_rgb = ar[..., :3]
-    blended = art_rgb * (im / 255.0)                    # Multiply -> Textur faerbt Form
-    m3 = (lum > 0.03)[..., None]
-    out_rgb = np.where(m3, blended, art_rgb)
-    if ar.shape[2] == 4:
-        out = np.concatenate([out_rgb, ar[..., 3:4]], 2)
-        return Image.fromarray(np.clip(out, 0, 255).astype("uint8"), "RGBA")
-    return Image.fromarray(np.clip(out_rgb, 0, 255).astype("uint8"), "RGB")
-
-
-def apply_effects(img, feat, bg="#000000", intensity=1.0, grain=True, bloom=True,
-                  chroma=True, seed=None, vignette=0.0, posterize_levels=0,
-                  halftone=0, streaks=0.0, depth=0.0):
-    scale = img.width / 1000.0
-    if depth > 0:
-        img = add_depth(img, depth)
-    if bloom:
-        img = add_bloom(img, feat["energy"] * intensity)
-    if streaks > 0:
-        img = add_streaks(img, streaks * (0.4 + 0.6 * feat["energy"]))
-    if chroma:
-        img = chroma_ab(img, int(feat["spread"] * intensity * 8 * scale))
-    if posterize_levels and posterize_levels >= 2:
-        img = posterize(img, posterize_levels)
-    if halftone and halftone >= 2:
-        img = add_halftone(img, int(halftone * scale), bg)
-    if vignette > 0:
-        img = add_vignette(img, vignette)
-    if grain:
-        img = add_grain(img, feat["roughness"] * intensity, seed=seed)
-    return img
+def _panel_effekte():
+    ss = st.session_state
+    st.selectbox("Platzierung", list(LAYOUTS), key="k_layout",
+                 help="Bricht die immer mittige Scheibe auf.")
+    st.slider("Groesse der Form", 0.4, 1.6, step=0.05, key="k_lscale")
+    st.divider()
+    st.checkbox("Effekte anwenden", key="k_fxon")
+    if not ss["k_fxon"]:
+        return
+    st.slider("Intensitaet", 0.0, 1.5, step=0.05, key="k_fxint")
+    f1, f2, f3 = st.columns(3)
+    f1.checkbox("Grain", key="k_g")
+    f2.checkbox("Bloom", key="k_b")
+    f3.checkbox("Aberr.", key="k_c")
+    with st.expander("Stilisierung (0 = aus)"):
+        g1, g2 = st.columns(2)
+        with g1:
+            st.slider("Vignette", 0.0, 1.0, step=0.05, key="k_vig")
+            st.slider("Licht-Streaks", 0.0, 1.0, step=0.05, key="k_streaks")
+            st.slider("Pseudo-Tiefe", 0.0, 1.0, step=0.05, key="k_depth")
+        with g2:
+            st.slider("Posterize", 0, 12, step=1, key="k_post")
+            st.slider("Halftone (px)", 0, 12, step=1, key="k_half")
+            st.number_input("Seed (0 = Dateiname)", 0, 999999, step=1, key="k_seed")
 
 
-
-def build(audio=None, mode="Rose gespiegelt", cmap=None, bg="#000000", size_px=3000,
-          params=None, signet=None, title=None, title_color="#ffffff",
-          start=0.0, end=None, mix_weights=None, transparent=False,
-          effects=None, return_features=False, y=None, sr=None,
-          image=None, image_mode=None):
-    params = params or {}
-    if y is None:
-        y, sr = load_audio(audio, start=start, end=end)
-    if mix_weights:
-        img = mix_modes(y, sr, mix_weights, cmap, bg, size_px, params,
-                        transparent=transparent)
-    else:
-        p = dict(params); p["transparent"] = transparent
-        fig = MODES[mode](y=y, sr=sr, cmap=cmap, bg=bg, size_px=size_px, **p)
-        img = fig_to_pil(fig, size_px, transparent=transparent)
-    if image is not None and image_mode:          # Bild in die Form (Masking / Textur)
-        pic = image if hasattr(image, "size") else Image.open(image)
-        img = apply_image(img, pic, image_mode, bg, transparent=transparent)
-    feat = None
-    if effects:
-        feat = features(y, sr)
-        img = apply_effects(img, feat, bg=bg, **effects)   # vor Signet/Titel
-    if signet: img = add_signet(img, signet)
-    if title: img = add_title(img, title, title_color)
-    if img.mode == "RGBA":                    # RGB-Muell auf transparenten Pixeln entfernen
-        arr = np.asarray(img).copy()
-        arr[arr[:, :, 3] == 0, :3] = 0
-        img = Image.fromarray(arr, "RGBA")
-    return (img, feat) if return_features else img
+def steuerpult(an, mode, mix_on, knobs):
+    t = st.tabs(["Form", "Farbe", "Druck", "Text", "Aufbau"])
+    with t[0]:
+        _panel_form(an, mode, mix_on, knobs)
+    with t[1]:
+        _panel_farbe(an)
+    with t[2]:
+        _panel_druck()
+    with t[3]:
+        _panel_text()
+    with t[4]:
+        _panel_effekte()
 
 
 # ----------------------------------------------------------------------
-# Multi-Format-Export (Social)
+# Export — am Ende des Blickverlaufs, direkt unter der Vorschau
 # ----------------------------------------------------------------------
-SIZES = {
-    "1x1_Quadrat":     (1080, 1080),
-    "4x5_IG-Feed":     (1080, 1350),
-    "9x16_Story_Reel_Canvas": (1080, 1920),
-    "16x9_YouTube":    (1920, 1080),
-}
+def export_block(an, recipe, kw, cmap):
+    """Groesse, Format, Rendern, Laden — in Leserichtung, unter der Vorschau.
 
-
-def export_svg(audio, mode, cmap, bg, params, transparent=False,
-               size_px=1000, title=None, title_color="#ffffff"):
-    """Einzelner Modus als SVG (Vektor). Ohne Raster-Effekte."""
-    y, sr = load_audio(audio)
-    p = dict(params); p["transparent"] = transparent
-    fig = MODES[mode](y=y, sr=sr, cmap=cmap, bg=bg, size_px=size_px, **p)
-    if title:
-        fig.text(0.5, 0.05, title, ha="center", color=title_color, fontsize=22)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="svg", transparent=transparent,
-                facecolor="none" if transparent else fig.get_facecolor())
-    plt.close(fig); buf.seek(0)
-    return buf.getvalue()
-
-
-def export_svg_layers(audio, weights, cmap, bg, base_params,
-                      transparent=False, size_px=1000):
-    """Aktive Mix-Layer je als eigene SVG (fuer manuelles Stapeln in Affinity)."""
-    y, sr = load_audio(audio)
-    out = {}
-    for mode, w in weights.items():
-        if w <= 0:
-            continue
-        p = _mode_params(mode, base_params); p["transparent"] = transparent
-        fig = MODES[mode](y=y, sr=sr, cmap=cmap, bg=bg, size_px=size_px, **p)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="svg", transparent=transparent,
-                    facecolor="none" if transparent else fig.get_facecolor())
-        plt.close(fig); buf.seek(0)
-        out[mode] = buf.getvalue()
-    return out
-
-
-
-    """Zentriert das quadratische Artwork auf allen Social-Seitenverhaeltnissen."""
-    res = {}
-    bg_rgb = _hex_rgb(bg)
-    for name, (W, H) in SIZES.items():
-        s = int(min(W, H) * margin)
-        art = square_img.resize((s, s), Image.LANCZOS)
-        pos = ((W - s) // 2, (H - s) // 2)
-        if transparent:
-            canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-            canvas.alpha_composite(art.convert("RGBA"), pos)
+    Vorher lagen Groesse und Format unten in der Seitenleiste und der
+    Knopf im Hauptbereich: der Abschluss der Arbeit war ueber zwei Orte
+    verteilt.
+    """
+    ss = st.session_state
+    c1, c2, c3 = st.columns([3, 2, 3], vertical_alignment="bottom")
+    with c1:
+        st.select_slider("Groesse (px)", options=[1000, 1500, 2000, 3000, 3543],
+                         key="k_size",
+                         help="3543 px = 30 cm bei 300 dpi (12-Zoll-Vinyl)")
+    with c2:
+        if ss["k_transp"]:
+            st.selectbox("Format", ["PNG"], disabled=True,
+                         help="Transparenz gibt es nur als PNG.")
         else:
-            canvas = Image.new("RGB", (W, H), bg_rgb)
-            art = art.convert("RGBA")
-            canvas.paste(art, pos, art)
-        res[name] = canvas
-    return res
+            st.selectbox("Format", ["PNG", "JPEG"], key="k_fmt")
+        st.checkbox("Transparent", key="k_transp")
+    fmt = "PNG" if recipe.transparent else ss["k_fmt"]
+    with c3:
+        if st.button(f"In {recipe.size} px rendern", type="primary",
+                     width="stretch", key="b_render"):
+            with st.spinner(f"Rendere {recipe.size} px ..."):
+                full = build(an, recipe, recipe.size, **kw)
+            ss["full_img"] = full
+            ss["full_recipe"] = recipe
+            ss["full_bytes"] = (save_jpeg(full) if fmt == "JPEG"
+                                else save_png(full, recipe))
+        if ss.get("full_bytes"):
+            st.download_button(f"{fmt} laden ({len(ss['full_bytes'])/1e6:.1f} MB)",
+                               ss["full_bytes"], f"cover.{fmt.lower()}",
+                               f"image/{fmt.lower()}", width="stretch")
 
-
-# ----------------------------------------------------------------------
-# Animierter Video-Export (Rose, audio-reaktiv)
-# ----------------------------------------------------------------------
-def _rose_frame(a, cmap, bg, size, mirror, thickness, inner, rotation,
-                data_thickness):
-    aa = np.clip(a, 0, 1)
-    N = len(aa)
-    fig, ax = _polar_fig(size, bg, rotation=rotation)
-    dt = (0.4 + 1.2 * aa) if data_thickness else 1.0
-    if mirror:
-        w = (np.pi / N) * thickness * dt
-        right = np.pi / 2 - np.linspace(0, np.pi, N)
-        left = np.pi / 2 + np.linspace(0, np.pi, N)
-        ax.bar(right, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-        ax.bar(left, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-    else:
-        w = (2 * np.pi / N) * thickness * dt
-        ang = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        ax.bar(ang, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-    return fig_to_pil(fig, size)
-
-
-def _mux_audio(audio, silent_path, out_path, duration):
-    """Originalton (nativ, auf Videolaenge geschnitten) unter das Video legen."""
-    import subprocess, tempfile as _tf, imageio_ffmpeg, soundfile as _sf, shutil
-    try:
-        if hasattr(audio, "seek"):
-            audio.seek(0)
-        ay, asr = librosa.load(audio, sr=None, mono=False, duration=duration)
-        awav = _tf.NamedTemporaryFile(suffix=".wav", delete=False).name
-        _sf.write(awav, ay.T if ay.ndim > 1 else ay, asr)
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([exe, "-y", "-i", silent_path, "-i", awav,
-                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                        "-shortest", out_path], check=True, capture_output=True)
-        return True
-    except Exception:
-        shutil.copy(silent_path, out_path)
-        return False
-
-
-def _canvas_setup(aspect):
-    W, H = SIZES[aspect]
-    W -= W % 2; H -= H % 2
-    return W, H, int(min(W, H) * 0.96)
-
-
-# ----------------------------------------------------------------------
-# Video-Animation.  Drehung IMMER im Uhrzeigersinn (rechts herum).
-# Alle Modi rendern pro Frame den aktuellen Moment.
-# ----------------------------------------------------------------------
-VIDEO_MODES = ["Rose gespiegelt", "Rose roh",
-               "Live-Kreisspektrum", "Live-Oszilloskop"]
-
-
-def _spectrum_frame(a, cmap, bg, size, mirror, thickness, inner, rotation):
-    """Aktuelles Spektrum als Balkenkranz (voll oder gespiegelt)."""
-    aa = np.clip(a, 0, 1); N = len(aa)
-    fig, ax = _polar_fig(size, bg, rotation=rotation)
-    if mirror:
-        w = (np.pi / N) * thickness * (0.5 + 1.0 * aa)
-        right = np.pi / 2 - np.linspace(0, np.pi, N)
-        left = np.pi / 2 + np.linspace(0, np.pi, N)
-        ax.bar(right, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-        ax.bar(left, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-    else:
-        w = (2 * np.pi / N) * thickness * (0.5 + 1.0 * aa)
-        ang = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        ax.bar(ang, aa, width=w, bottom=inner, color=cmap(aa), lw=0)
-    return fig_to_pil(fig, size)
-
-
-def _scope_frame(w, cmap, bg, size, thickness, inner, rotation):
-    """Aktuelles Wellenform-Fenster als geschlossener Ring (Oszilloskop)."""
-    n = len(w)
-    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    base = inner + 0.45
-    amp = np.clip(w, -1, 1) * 0.3 * thickness
-    th = np.append(theta, theta[0]); rr = np.append(base + amp, base + amp[0])
-    fig, ax = _polar_fig(size, bg, rotation=rotation)
-    pts = np.column_stack([th, rr])
-    segs = np.stack([pts[:-1], pts[1:]], axis=1)
-    lc = LineCollection(segs, colors=cmap(np.abs(np.append(amp, amp[0]))[:-1] /
-                                          (np.abs(amp).max() + 1e-9)),
-                        linewidths=2.6 * thickness)
-    ax.add_collection(lc)
-    ax.fill_between(th, base, rr, color=cmap(0.5), alpha=0.28, lw=0)
-    ax.set_ylim(0, 1.1)
-    return fig_to_pil(fig, size)
-
-
-def animate(audio, mode, cmap, bg, params, out_path, duration=5.0, fps=24,
-            aspect="9x16_Story_Reel_Canvas", rotate_turns=0.25, react=1.0,
-            smoothing=0.35, with_audio=True, effects=None, spin=True):
-    """Video-Renderer. Dreht immer rechts herum (Uhrzeigersinn).
-       effects: dict wie in build() -> wird auf jeden Frame angewendet."""
-    import imageio, tempfile as _tf
-    y, sr = load_audio(audio, end=duration)
-    duration = min(duration, len(y) / sr)
-    nm = params.get("n_mels", 110)
-    thick0 = params.get("thickness", 1.0); rot0 = params.get("rotation", 0.0)
-    inner = params.get("inner", 0.15)
-    mirror = (mode != "Rose roh")
-    turns = rotate_turns if spin else 0.0
-
-    is_scope = (mode == "Live-Oszilloskop")
-    if not is_scope:
-        S = punch(norm01(mel_db(y, sr, nm)),
-                  params.get("gate", 0.15), params.get("gamma", 1.4))
-        a0 = S.mean(axis=1); T = S.shape[1]
-
-    feat = features(y, sr) if effects else None
-    W, H, side = _canvas_setup(aspect)
-    bg_rgb = _hex_rgb(bg)
-    frames = int(duration * fps)
-    target = _tf.NamedTemporaryFile(suffix=".mp4", delete=False).name if with_audio else out_path
-    writer = imageio.get_writer(target, fps=fps, codec="libx264",
-                                quality=8, macro_block_size=None)
-    prev = None
-    win = int(sr / max(1, fps) * 2)                       # Fenster fuers Oszilloskop
-    for f in range(frames):
-        p = f / max(1, frames - 1)
-        rot = rot0 - turns * 360.0 * p                    # MINUS = rechts herum
-        if is_scope:
-            c = int(p * max(1, len(y) - win))
-            seg = y[c:c + win]
-            if len(seg) < win:
-                seg = np.pad(seg, (0, win - len(seg)))
-            step = max(1, len(seg) // 720)
-            wv = seg[::step][:720]
-            wv = wv / (np.abs(y).max() + 1e-9)
-            if prev is not None and len(prev) == len(wv):
-                wv = smoothing * prev + (1 - smoothing) * wv
-            prev = wv
-            art = _scope_frame(wv, cmap, bg, side, thick0, inner, rot)
+    with st.expander("Weitere Ausgaben und Pruefungen"):
+        if not ss.get("full_bytes"):
+            st.caption("Erst in voller Groesse rendern.")
         else:
-            c1 = int(p * (T - 1))
-            c0 = int((f - 1) / max(1, frames - 1) * (T - 1)) if f > 0 else c1
-            live = S[:, min(c0, c1):max(c0, c1) + 1].mean(axis=1)
-            a = (1 - react) * a0 + react * live
-            if prev is not None and len(prev) == len(a):
-                a = smoothing * prev + (1 - smoothing) * a
-            prev = a
-            if mode == "Live-Kreisspektrum":
-                art = _spectrum_frame(a, cmap, bg, side, False, thick0, inner, rot)
+            data, full, rr = ss["full_bytes"], ss["full_img"], ss["full_recipe"]
+            d1, d2 = st.columns(2)
+            with d1:
+                if st.button("Social-Formate (ZIP)", width="stretch"):
+                    with st.spinner("Erzeuge Formate ..."):
+                        fmts = export_formats(full, rr.bg, rr.transparent,
+                                              rr.layout, rr.layout_scale)
+                        ss["zip_bytes"] = formats_zip(fmts, rr)
+                if ss.get("zip_bytes"):
+                    st.download_button("ZIP laden — 1:1 · 4:5 · 9:16 · 16:9",
+                                       ss["zip_bytes"], "social_formate.zip",
+                                       "application/zip", width="stretch")
+            with d2:
+                vec = [m for m in (list(rr.mix) if rr.mix else [rr.mode])
+                       if rr.mix.get(m, 1) > 0 and MODES[m].vector]
+                if not vec and rr.mix and not any(rr.mix.values()):
+                    st.caption("Keine aktive Ebene — alle Mix-Gewichte auf 0.")
+                elif not vec:
+                    st.caption("Der Modus ist rasterbasiert (kein SVG).")
+                elif st.button("SVG erzeugen", width="stretch"):
+                    with st.spinner("Vektorisiere ..."):
+                        lagen = export_svg_layers(an, rr, 1200, cmap)
+                    if len(lagen) == 1:
+                        name, d = next(iter(lagen.items()))
+                        ss["svg"] = (f"{name}.svg", d, "image/svg+xml")
+                    else:
+                        ss["svg"] = ("ebenen.zip", svg_zip(lagen, rr),
+                                     "application/zip")
+                if ss.get("svg"):
+                    name, d, mime = ss["svg"]
+                    st.download_button(f"{name} ({len(d)/1e6:.1f} MB)", d, name,
+                                       mime, width="stretch")
+            plat = st.selectbox("Abgabepruefung", list(PLATFORM_SPECS))
+            chk = platform_check(full, plat, data)
+            (st.success if chk["ok"] else st.warning)(
+                "Passt." if chk["ok"] else " · ".join(chk["issues"]))
+
+        rep = print_report(recipe)
+        st.caption("Druckpruefung (Naeherung ohne ICC-Profil) — oben die "
+                   "Bildschirmfarbe, unten dieselbe nach dem Beschnitt auf "
+                   "den Offset-Farbraum.")
+        zellen = "".join(
+            f'<div style="flex:1;min-width:74px;text-align:center;'
+            f'font:11px/1.5 system-ui"><div style="height:30px;'
+            f'background:{r["hex"]};border-radius:4px 4px 0 0"></div>'
+            f'<div style="height:30px;background:{r["clipped"]};'
+            f'border-radius:0 0 4px 4px"></div>{r["hex"]}<br>{r["ratio"]:.2f}x'
+            f'{"" if r["printable"] else " ⚠"}</div>' for r in rep["rows"])
+        st.markdown(f'<div style="display:flex;gap:6px">{zellen}</div>',
+                    unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------
+# Reiter
+# ----------------------------------------------------------------------
+def tab_bild(an, audio_name, cmap, img_pic, sig_path, up):
+    ss = st.session_state
+    mode, mix_on = ss["k_mode"], ss["k_mixon"]
+    if mix_on:
+        aktive = [m for m, k in MIX_KEYS.items() if ss[k] > 0] or [mode]
+        knobs = set().union(*(MODES[m].knobs() for m in aktive))
+    else:
+        knobs = MODES[mode].knobs()
+
+    recipe = recipe_from_state(an, audio_name)
+    kw = dict(cmap=cmap, image=img_pic, image_mode=ss["k_imgmode"],
+              signet=sig_path)
+
+    st.session_state["_knobs"] = knobs
+    links, rechts = st.columns([5, 4], gap="large")
+    with links:
+        if ss["k_live"]:
+            try:
+                befund = {}
+                #  Das vorige Bild bleibt stehen, bis das neue fertig ist.
+                #  Sonst ist der Bildplatz waehrend des Rechnens leer, alles
+                #  darunter rutscht um die Bildhoehe hoch und wieder zurueck —
+                #  das ist das Springen, das die Oberflaeche unruhig macht.
+                platz = st.empty()
+                if ss.get("_letzte_vorschau") is not None:
+                    platz.image(ss["_letzte_vorschau"], width="stretch")
+                with st.spinner("Vorschau ..."):
+                    img, feat = build(an, recipe, PREVIEW_PX,
+                                      return_features=True, report=befund, **kw)
+                gezeigt = (draw_safe_area(img, ss["k_safe"])
+                           if ss["k_safe"] != "Aus" else img)
+                ss["_letzte_vorschau"] = gezeigt
+                platz.image(gezeigt, width="stretch")
+                unten = st.columns([3, 2])
+                unten[0].caption(f"Vorschau {PREVIEW_PX} px · Export "
+                                 f"{recipe.size} px")
+                if feat:
+                    unten[1].caption(f"Grain {feat['roughness']:.2f} · "
+                                     f"Bloom {feat['energy']:.2f} · "
+                                     f"Aberr. {feat['spread']:.2f}")
+                if befund:
+                    _zeige_kontrast(befund)
+            except Exception as e:
+                st.error(f"Render-Fehler: {e}")
+        else:
+            st.info("Live-Vorschau ist aus — links in der Seitenleiste.")
+        st.divider()
+        export_block(an, recipe, kw, cmap)
+
+    with rechts:
+        steuerpult(an, mode, mix_on, knobs)
+
+
+def tab_video(an, audio_name, cmap, up):
+    ss = st.session_state
+    recipe = recipe_from_state(an, audio_name)
+    c1, c2, c3 = st.columns(3)
+    v_mode = c1.selectbox("Video-Modus", VIDEO_MODES, index=2)
+    v_asp = c2.selectbox("Format", list(SIZES), index=2)
+    v_fps = c3.select_slider("FPS", [12, 24, 30], value=24)
+    c4, c5, c6 = st.columns(3)
+    v_dur = c4.number_input("Dauer (s)", 2.0, 300.0, 8.0, 1.0)
+    v_turn = c5.slider("Umdrehungen", 0.0, 4.0, 1.0, 0.25)
+    v_pulse = c6.slider("Beat-Puls", 0.0, 1.0, 0.4, 0.05,
+                        help="Bindet Dicke und Innenradius an den Schlag.")
+    c7, c8, c9 = st.columns(3)
+    v_loop = c7.checkbox("Loopfaehig", True,
+                         help="Laenge auf den Taktanfang, ganze Umdrehungen, "
+                              "Ueberblendung am Schleifenpunkt.")
+    v_fx = c8.checkbox("Effekte anwenden", True)
+    v_audio = c9.checkbox("Originalton einbetten", True)
+    v_blend = st.slider("Ueberblendung am Schleifenpunkt", 0.0, 0.5, 0.15, 0.05,
+                        disabled=not v_loop)
+    if v_loop:
+        snapped = loop_length(an, v_dur, (1.0, an.duration))
+        ok = SPOTIFY_CANVAS[0] <= snapped <= SPOTIFY_CANVAS[1]
+        st.caption(f"Loopfaehige Laenge: **{snapped:.2f} s** (naechster Taktanfang)"
+                   + ("" if ok else " — ausserhalb der Spotify-Spanne 3–8 s"))
+
+    if st.button("Video erzeugen", type="primary", width="stretch"):
+        from sonicart.video import animate
+        bar = st.progress(0.0, "Rendere ...")
+        try:
+            outp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            info = animate(an, recipe, outp, audio=up, mode=v_mode,
+                           duration=v_dur, fps=v_fps, aspect=v_asp,
+                           rotate_turns=v_turn, pulse=v_pulse, effects=v_fx,
+                           loop_safe=v_loop, loop_blend=v_blend,
+                           with_audio=v_audio,
+                           progress=lambda p: bar.progress(p, f"Rendere {p:.0%}"))
+            bar.empty()
+            ss["video"] = open(info["path"], "rb").read()
+            msg = (f"{info['duration']:.2f} s · {info['frames']} Frames · "
+                   f"{info['turns']:g} Umdrehungen")
+            if v_audio and not info["audio"]:
+                st.warning(msg + " — Ton konnte nicht gemuxt werden (ffmpeg fehlt).")
             else:
-                art = _rose_frame(a, cmap, bg, side, mirror, thick0, inner, rot,
-                                  params.get("data_thickness", True))
-        if effects:
-            art = apply_effects(art, feat, bg=bg, **effects)
-        canvas = Image.new("RGB", (W, H), bg_rgb)
-        canvas.paste(art.convert("RGB"), ((W - side) // 2, (H - side) // 2))
-        writer.append_data(np.asarray(canvas))
-    writer.close()
-    if with_audio:
-        _mux_audio(audio, target, out_path, duration)
-    return out_path
+                st.success(msg)
+        except ModuleNotFoundError:
+            bar.empty()
+            st.error("Video braucht: pip install imageio imageio-ffmpeg")
+        except Exception as e:
+            bar.empty()
+            st.error(f"Video-Fehler: {e}")
+    if ss.get("video"):
+        v1, v2 = st.columns([2, 3])
+        with v1:
+            st.video(ss["video"])
+        v2.download_button("MP4 laden", ss["video"], "visualizer.mp4",
+                           "video/mp4", width="stretch")
 
 
+def tab_album(cmap):
+    st.caption("Ein Ordner mit Titeln wird zur Serie: die Palettenstruktur "
+               "bleibt, der Farbton wandert pro Titel innerhalb der Spreizung. "
+               "Die Form kommt weiter aus dem Audio, also bleibt jeder Titel eigen.")
+    c1, c2 = st.columns(2)
+    folder = c1.text_input("Ordner mit Audiodateien", placeholder="/Users/…/release")
+    out = c2.text_input("Zielordner", placeholder="/Users/…/release/cover")
+    d1, d2, d3 = st.columns(3)
+    size = d1.select_slider("Groesse (px)", [1000, 1500, 2000, 3000, 3543],
+                            value=3000, key="alb_size")
+    spread = d2.slider("Farbspreizung (Grad)", 0, 120, 40, 5,
+                       help="0 = alle Titel farbgleich, 120 = stark gefaechert")
+    shared = d3.checkbox("Gemeinsame Palette", True)
+    e1, e2 = st.columns(2)
+    fmts = e1.checkbox("Social-Formate je Titel")
+    jpeg = e2.checkbox("JPEG statt PNG")
+    if st.button("Serie rendern", type="primary", disabled=not (folder and out),
+                 width="stretch"):
+        bar = st.progress(0.0, "Start ...")
+
+        def prog(ev):
+            kind, i, n, name = ev
+            bar.progress(i / (2 * n) + (0.5 if kind == "render" else 0),
+                         f"{kind}: {name} ({i}/{n})")
+        try:
+            rep = render_album(folder, recipe_from_state(None), out, size=size,
+                               shared_palette=shared, spread_deg=spread,
+                               formats=fmts, jpeg=jpeg, progress=prog)
+            bar.empty()
+            st.success(f"{len(rep['titel'])} Titel -> {rep['verzeichnis']}")
+            f1, f2 = st.columns([3, 2])
+            f1.image(os.path.join(out, rep["kontaktbogen"]), caption="Kontaktbogen")
+            f2.dataframe([{k: t[k] for k in
+                           ("track", "tonart", "tempo_bpm", "taktart")}
+                          for t in rep["titel"]], width="stretch")
+        except Exception as e:
+            bar.empty()
+            st.error(f"Album-Fehler: {e}")
 
 
-# ----------------------------------------------------------------------
-# Streamlit-UI
 # ----------------------------------------------------------------------
 def main():
-    import streamlit as st, tempfile, hashlib, json, zipfile, io as _io
-    ss = st.session_state
-    st.set_page_config(page_title="Sonic Artwork", layout="wide")
+    st.set_page_config(page_title="Sonic Artwork", layout="wide",
+                       initial_sidebar_state="expanded")
+    init_state()
+    up, an, lut, img_up, signet_up = sidebar()
 
-    @st.cache_data(show_spinner=False)
-    def decode(data):
-        return load_audio(_io.BytesIO(data))
-
-    defaults = {
-        "k_mode": list(MODES.keys())[0], "k_mixon": False, "k_preset": "Korrend",
-        "k_w_gesp": 0.7, "k_w_roh": 0.0, "k_w_hpss": 0.8, "k_w_wave": 0.0,
-        "k_thick": 1.0, "k_gate": 0.15, "k_gamma": 1.5, "k_rot": 0,
-        "k_inner": 0.15, "k_nmels": 110, "k_dthick": True, "k_onset": 0.25,
-        "k_spoke": 0.35,
-        "k_fxon": False, "k_fxint": 1.0, "k_g": True, "k_b": True, "k_c": True,
-        "k_seed": 0, "k_size": 3000, "k_transp": False, "k_fmt": "PNG", "k_live": True,
-        "k_anchor": "#7b2ff7", "k_harmony": "Monochrom-Ramp",
-        "k_vig": 0.0, "k_post": 0, "k_half": 0, "k_streaks": 0.0, "k_depth": 0.0,
-        "k_imgmode": "—",
-        "n_stops": len(PRESETS["Korrend"]), "bg_key": PROFILE_BG["Korrend"],
-    }
-    for k, v in defaults.items():
-        ss.setdefault(k, v)
-    for i, c in enumerate(PRESETS["Korrend"]):
-        ss.setdefault(f"c{i}", c)
-    save_keys = list(defaults.keys())
-
-    # ---------------------------- SIDEBAR ----------------------------
-    with st.sidebar:
-        st.header("Sonic Artwork")
-        up = st.file_uploader("Audiodatei", type=["wav", "mp3", "flac", "ogg", "m4a"])
-
-        with st.expander("Presets speichern / laden"):
-            pfile = st.file_uploader("Laden (.json)", type=["json"], key="k_loadfile")
-            if pfile is not None and st.button("Anwenden"):
-                try:
-                    data = json.load(pfile)
-                    for k, v in data.items():
-                        ss[k] = v
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Preset ungueltig: {e}")
-            n_now = int(ss.get("n_stops", 4))
-            cfg = {k: ss[k] for k in save_keys}
-            cfg["n_stops"] = n_now
-            for i in range(n_now):
-                cfg[f"c{i}"] = ss.get(f"c{i}", "#ffffff")
-            st.download_button("Speichern (.json)", json.dumps(cfg, indent=2),
-                               "preset.json", "application/json")
-
-        mode = st.selectbox("Modus", list(MODES.keys()), key="k_mode")
-        mix_on = st.checkbox("Modi mischen", key="k_mixon")
-        mix_w = {}
-        if mix_on:
-            mix_w = {
-                "Rose gespiegelt":  st.slider("Rose g.", 0.0, 1.0, step=0.05, key="k_w_gesp"),
-                "Rose roh":         st.slider("Rose roh", 0.0, 1.0, step=0.05, key="k_w_roh"),
-                "HPSS-Zeit":        st.slider("HPSS", 0.0, 1.0, step=0.05, key="k_w_hpss"),
-                "Kreis-Wellenform": st.slider("Welle", 0.0, 1.0, step=0.05, key="k_w_wave"),
-            }
-            st.caption("Rose x HPSS/Welle ist ergiebig; zwei Rosen sind redundant.")
-
-        st.subheader("Palette")
-        preset = st.selectbox("Preset", list(PRESETS.keys()), key="k_preset")
-        if st.button("Preset laden"):
-            cp = PRESETS[preset]; ss["n_stops"] = len(cp)
-            for i, c in enumerate(cp):
-                ss[f"c{i}"] = c
-            ss["bg_key"] = PROFILE_BG[preset]
-            st.rerun()
-
-        with st.expander("Palette-Generator (Farbtheorie)"):
-            anchor = st.color_picker("Ankerfarbe", key="k_anchor")
-            harmony = st.selectbox(
-                "Harmonie",
-                ["Monochrom-Ramp", "Analog", "Komplementaer-Akzent",
-                 "Triadisch", "Profil-Struktur"], key="k_harmony")
-            st.caption("Profil-Struktur = Helligkeits-/Saettigungsverlauf des "
-                       "gewaehlten Presets uebernehmen, nur Farbton tauschen "
-                       "(konsistente Releases).")
-            if st.button("Palette generieren"):
-                try:
-                    if harmony == "Profil-Struktur":
-                        tmpl = PRESETS[ss["k_preset"]]
-                        newp = generate_palette(anchor, len(tmpl), harmony, template=tmpl)
-                    else:
-                        newp = generate_palette(anchor, int(ss["n_stops"]), harmony)
-                    ss["n_stops"] = len(newp)
-                    for i, cc in enumerate(newp):
-                        ss[f"c{i}"] = cc
-                    ss["bg_key"] = newp[0]
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Generator-Fehler: {e}")
-
-        n = st.slider("Farbstufen", 2, 6, key="n_stops")
-        cols = st.columns(n)
-        stops = []
-        for i in range(n):
-            ss.setdefault(f"c{i}", "#ffffff")
-            stops.append(cols[i].color_picker(f"{i+1}", key=f"c{i}"))
-        bg = st.color_picker("Hintergrund", key="bg_key")
-        lut = st.file_uploader("LUT statt Palette (.cube)", type=["cube"])
-
-        st.subheader("Regler")
-        thickness = st.slider("Dicke", 0.3, 3.0, step=0.1, key="k_thick")
-        gate = st.slider("Gate (Rauschen)", 0.0, 0.8, step=0.05, key="k_gate")
-        gamma = st.slider("Gamma (Kontrast)", 0.8, 2.5, step=0.1, key="k_gamma")
-        rotation = st.slider("Winkel drehen (Grad)", 0, 360, step=5, key="k_rot")
-
-        hpss_active = (mode == "HPSS-Zeit") or (mix_on and mix_w.get("HPSS-Zeit", 0) > 0)
-        rose_modes = ("Rose gespiegelt", "Rose roh", "Kreis-Wellenform")
-        rose_active = (mode in rose_modes) or (mix_on and any(mix_w.get(m, 0) > 0 for m in rose_modes))
-        with st.expander("Mehr"):
-            inner = st.slider("Innenradius", 0.0, 0.4, step=0.01, key="k_inner")
-            n_mels = st.slider("Frequenzaufloesung (Bins)", 60, 256, step=2, key="k_nmels")
-            data_thick = (st.checkbox("Dicke datengetrieben (Loudness)", key="k_dthick")
-                          if rose_active else ss["k_dthick"])
-            onset = (st.slider("Onset-Akzent", 0.0, 1.0, step=0.05, key="k_onset")
-                     if hpss_active else ss["k_onset"])
-            spoke_len = (st.slider("Speichen-Laenge (HPSS)", 0.1, 1.0, step=0.05, key="k_spoke")
-                         if hpss_active else ss["k_spoke"])
-
-        st.subheader("Effekte")
-        fx_on = st.checkbox("Effekte anwenden", key="k_fxon")
-        fx = None
-        if fx_on:
-            fx_int = st.slider("Intensitaet", 0.0, 1.5, step=0.05, key="k_fxint")
-            f1, f2, f3 = st.columns(3)
-            g = f1.checkbox("Grain", key="k_g"); b = f2.checkbox("Bloom", key="k_b")
-            c = f3.checkbox("Aberr.", key="k_c")
-            seed_in = st.number_input("Seed (0=Datei)", 0, 999999, step=1, key="k_seed")
-            st.caption("Stilisierung (0 = aus):")
-            vignette = st.slider("Vignette", 0.0, 1.0, step=0.05, key="k_vig")
-            streaks = st.slider("Licht-Streaks", 0.0, 1.0, step=0.05, key="k_streaks")
-            depth = st.slider("Pseudo-Tiefe (DoF)", 0.0, 1.0, step=0.05, key="k_depth")
-            post_lv = st.slider("Posterize (Farbstufen, 0=aus)", 0, 12, step=1, key="k_post")
-            half = st.slider("Halftone (Rasterweite px, 0=aus)", 0, 12, step=1, key="k_half")
-            fx = dict(intensity=fx_int, grain=g, bloom=b, chroma=c,
-                      seed=(seed_in or None), vignette=vignette, streaks=streaks,
-                      depth=depth, posterize_levels=post_lv, halftone=half)
-
-        st.subheader("Bild / Textur")
-        img_up = st.file_uploader("Bild oder Textur (optional)", type=["png", "jpg", "jpeg"])
-        img_mode = st.selectbox("Modus", ["—", "Masking", "Textur-Blend"], key="k_imgmode")
-        st.caption("Masking = Bild NUR innerhalb der Audio-Form. "
-                   "Textur-Blend = Textur faerbt die Form. "
-                   "Fotos wirken besser mit HPSS/gefuellten Formen als mit der Rose.")
-
-        st.subheader("Export-Einstellungen")
-        size = st.select_slider("Voll-Groesse (px)", options=[1000, 1500, 2000, 3000], key="k_size")
-        transparent = st.checkbox("Transparent (ohne Schwarz, PNG)", key="k_transp")
-        fmt = "PNG" if transparent else st.selectbox("Format", ["PNG", "JPEG"], key="k_fmt")
-        title = st.text_input("Titel (optional)")
-        signet_up = st.file_uploader("Signet (PNG)", type=["png"])
-        live = st.checkbox("Live-Vorschau (auto-aktualisiert)", key="k_live")
-
-    # ---------------------------- MAIN ----------------------------
-    st.title("Sonic Artwork")
     if not up:
-        st.info("Lade links in der Seitenleiste eine Audiodatei — dann erscheinen Vorschau und Export.")
+        st.markdown("## Sonic Artwork")
+        st.info("Lade links eine Audiodatei — dann erscheinen Analyse, "
+                "Vorschau und Export.")
+        return
+    if an is None:
         return
 
+    analyse_zeile(an)
     try:
-        y, sr = decode(up.getvalue())
-    except Exception as e:
-        st.error(f"Audio konnte nicht gelesen werden: {e}")
-        return
-
-    try:
-        cmap = make_cmap(stops)
-        if lut:
-            p = tempfile.NamedTemporaryFile(suffix=".cube", delete=False)
-            p.write(lut.getvalue()); p.close(); cmap = cmap_from_cube(p.name)
+        cmap = get_lut(lut.getvalue()) if lut else make_cmap(stops_from_state())
     except Exception as e:
         st.error(f"Palette/LUT ungueltig, nutze Standard: {e}")
         cmap = make_cmap(["#000000", "#ffffff"])
@@ -996,120 +1110,24 @@ def main():
     sig_path = None
     if signet_up:
         p = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        p.write(signet_up.getvalue()); p.close(); sig_path = p.name
-
-    base = dict(thickness=thickness, gate=gate, gamma=gamma,
-                inner=inner, n_mels=n_mels, rotation=rotation)
-    fx_use = None
-    if fx is not None:
-        fx_use = dict(fx)
-        if fx_use["seed"] is None:
-            fx_use["seed"] = int(hashlib.md5(up.name.encode()).hexdigest(), 16) % (2**32)
-
-    img_pic, img_mode_val = None, None
-    if img_up is not None and img_mode != "—":
+        p.write(signet_up.getvalue())
+        p.close()
+        sig_path = p.name
+    img_pic = None
+    if img_up is not None and st.session_state["k_imgmode"] != "—":
         try:
-            img_pic = Image.open(_io.BytesIO(img_up.getvalue())).convert("RGB")
-            img_mode_val = img_mode
+            img_pic = Image.open(io.BytesIO(img_up.getvalue())).convert("RGB")
         except Exception as e:
             st.error(f"Bild konnte nicht gelesen werden: {e}")
 
-    def render(size_px):
-        common = dict(cmap=cmap, bg=bg, size_px=size_px, signet=sig_path,
-                      title=title or None, title_color=stops[-1],
-                      transparent=transparent, effects=fx_use,
-                      return_features=True, y=y, sr=sr,
-                      image=img_pic, image_mode=img_mode_val)
-        if mix_on and any(v > 0 for v in mix_w.values()):
-            return build(mode=mode, params=base, mix_weights=mix_w, **common)
-        params = dict(base)
-        if mode == "HPSS-Zeit":
-            params["onset"] = onset; params["gate"] = max(gate, 0.4)
-            params["spoke_len"] = spoke_len
-        else:
-            params["data_thickness"] = data_thick
-        return build(mode=mode, params=params, **common)
-
-    col_prev, col_exp = st.columns([3, 2])
-    with col_prev:
-        if live:
-            try:
-                with st.spinner("Vorschau ..."):
-                    img, feat = render(700)
-                st.image(img, caption="Live-Vorschau (700 px) — Export rendert in voller Groesse")
-                if feat:
-                    st.caption(f"Features -> Grain {feat['roughness']:.2f} · "
-                               f"Bloom {feat['energy']:.2f} · Aberration {feat['spread']:.2f}")
-            except Exception as e:
-                st.error(f"Render-Fehler: {e}")
-        else:
-            st.info("Live-Vorschau ist aus. Rechts 'In voller Groesse exportieren'.")
-
-    with col_exp:
-        st.subheader("Export")
-        if st.button("In voller Groesse exportieren", type="primary"):
-            try:
-                with st.spinner(f"Rendere {size}px ..."):
-                    img, _ = render(size)
-                    buf = _io.BytesIO()
-                    img.save(buf, format=fmt, quality=92 if fmt == "JPEG" else None)
-                    buf.seek(0)
-                st.download_button(f"{fmt} laden", buf, f"cover.{fmt.lower()}",
-                                   f"image/{fmt.lower()}")
-            except Exception as e:
-                st.error(f"Export-Fehler: {e}")
-
-        if st.button("Social-Formate (ZIP)"):
-            try:
-                with st.spinner("Erzeuge Formate ..."):
-                    img, _ = render(size)
-                    fmts = export_formats(img, bg, transparent=transparent)
-                    zbuf = _io.BytesIO()
-                    with zipfile.ZipFile(zbuf, "w") as z:
-                        for name, im in fmts.items():
-                            b = _io.BytesIO(); im.save(b, format="PNG")
-                            z.writestr(f"{name}.png", b.getvalue())
-                    zbuf.seek(0)
-                st.caption("Quadrat · 4:5 · 9:16 · 16:9")
-                st.download_button("ZIP laden", zbuf, "social_formats.zip", "application/zip")
-            except Exception as e:
-                st.error(f"Batch-Fehler: {e}")
-
-    with st.expander("Video (Canvas / Reel)"):
-        v_mode = st.selectbox("Video-Modus", VIDEO_MODES,
-                              index=VIDEO_MODES.index(mode) if mode in VIDEO_MODES else 2)
-        v_asp = st.selectbox("Format", list(SIZES.keys()), index=2)
-        v_dur = st.number_input("Dauer (s)", 2.0, 300.0, 5.0, 1.0,
-                                help="Spotify Canvas max. 8 s; Renderzeit steigt linear.")
-        v_fps = st.select_slider("FPS", options=[12, 24, 30], value=24)
-        v_spin = st.checkbox("Drehen (immer rechts herum)", value=True)
-        v_turn = st.slider("Umdrehungen", 0.0, 2.0, 0.25, 0.05,
-                           help="Wie oft sich das Bild waehrend des Videos dreht.")
-        v_smooth = st.slider("Glaettung (gegen Zappeln)", 0.0, 0.9, 0.35, 0.05)
-        v_react = (st.slider("Bin-Bewegung (0=global, 1=pro Frequenz)", 0.0, 1.0, 1.0, 0.05)
-                   if v_mode != "Live-Oszilloskop" else 1.0)
-        v_fx = st.checkbox("Effekte auch im Video anwenden", value=True,
-                           help="Nutzt die Effekt-Einstellungen aus der Seitenleiste. "
-                                "Erhoeht die Renderzeit deutlich.")
-        v_audio = st.checkbox("Originalton einbetten", value=True)
-        if st.button("Video erzeugen"):
-            try:
-                vparams = dict(base)
-                vparams["data_thickness"] = data_thick
-                with st.spinner("Rendere Video (kann dauern) ..."):
-                    outp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-                    animate(up, v_mode, cmap, bg, vparams, outp,
-                            duration=v_dur, fps=v_fps, aspect=v_asp,
-                            rotate_turns=v_turn, spin=v_spin, react=v_react,
-                            smoothing=v_smooth, with_audio=v_audio,
-                            effects=(fx_use if v_fx else None))
-                    vbytes = open(outp, "rb").read()
-                st.video(vbytes)
-                st.download_button("MP4 laden", vbytes, "visualizer.mp4", "video/mp4")
-            except ModuleNotFoundError:
-                st.error("Video braucht: pip install imageio imageio-ffmpeg")
-            except Exception as e:
-                st.error(f"Video-Fehler: {e}")
+    t1, t2, t3 = st.tabs(["Bild", "Video", "Album"])
+    with t1:
+        tab_bild(an, up.name, cmap, img_pic, sig_path, up)
+    with t2:
+        tab_video(an, up.name, cmap, up)
+    with t3:
+        tab_album(cmap)
+    spiegeln(st.session_state.get("_knobs"))
 
 
 if __name__ == "__main__":

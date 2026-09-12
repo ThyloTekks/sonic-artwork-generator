@@ -1,0 +1,3 @@
+# Nur fuer Entwicklung und Tests, nicht fuer den Betrieb noetig.
+-r requirements.txt
+pytest>=8,<9

@@ -1,0 +1,27 @@
+[project]
+name = "sonic-artwork"
+version = "0.2.0"
+description = "Audio in Cover-Artwork uebersetzen — Analyse, Bildmodi, Album-Serie, Canvas-Video"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.scripts]
+sonicart = "sonicart.cli:main"
+
+[tool.setuptools]
+packages = ["sonicart", "sonicart.render"]
+
+[tool.setuptools.package-data]
+#  Die mitgelieferten Schriften (SIL OFL) gehoeren ins Paket, sonst faellt
+#  der Textsatz nach einer Installation auf Pillows Standardschrift zurueck.
+sonicart = ["fonts/*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:audioread.*",
+    "ignore:Trying to estimate tuning from empty frequency set.:UserWarning",
+]
