@@ -16,6 +16,7 @@ import numpy as np
 from matplotlib.collections import LineCollection
 from PIL import Image
 
+from . import ffmpeg
 from .analysis import Analysis, punch
 from .artwork import Recipe
 from .effects import apply_effects
@@ -132,7 +133,6 @@ def _lissajous_frame(l, r, cmap, bg, size, thickness, rotation, res=420):
 def _mux_audio(audio, silent_path, out_path, duration, start=0.0):
     """Originalton (nativ, auf die Videolaenge geschnitten) unter das Video legen."""
     try:
-        import imageio_ffmpeg
         import librosa
         import soundfile as sf
         if hasattr(audio, "seek"):
@@ -141,8 +141,7 @@ def _mux_audio(audio, silent_path, out_path, duration, start=0.0):
                                offset=start, duration=duration)
         awav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
         sf.write(awav, ay.T if ay.ndim > 1 else ay, asr)
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([exe, "-y", "-i", silent_path, "-i", awav,
+        subprocess.run([ffmpeg.exe(), "-y", "-i", silent_path, "-i", awav,
                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                         "-shortest", out_path], check=True, capture_output=True)
         return True
