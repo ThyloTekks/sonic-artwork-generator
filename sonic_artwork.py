@@ -22,6 +22,7 @@ import tempfile
 import streamlit as st
 from PIL import Image
 
+from sonicart import ffmpeg, footage
 from sonicart.album import render_album
 from sonicart.analysis import Analysis, load
 from sonicart.artwork import DEFAULT_PARAMS, Recipe, build
@@ -60,6 +61,21 @@ def get_lut(data: bytes):
     p.write(data)
     p.close()
     return cmap_from_cube(p.name)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _stash(data: bytes, suffix: str) -> str:
+    """Upload einmal auf Platte legen; ffmpeg braucht Pfade, keine Puffer."""
+    p = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    p.write(data)
+    p.close()
+    return p.name
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _stash_clut(stops: tuple) -> str:
+    """Ein CLUT je Palette — 262144 Eintraege lohnen das Aufheben."""
+    return footage.clut_file(list(stops))
 
 
 #  Voreinstellung ist ein matter Druck, kein leuchtendes Diagramm: Papier
@@ -1045,6 +1061,90 @@ def tab_video(an, audio_name, cmap, up):
                            "video/mp4", width="stretch")
 
 
+def tab_footage(up):
+    """Fremdmaterial auf die Palette dieses Tracks bringen."""
+    ss = st.session_state
+    stops = stops_from_state()
+    st.caption("Beliebigen Clip ueber die Palette dieses Tracks einfaerben. "
+               "Der Farbton des Originals faellt weg, Struktur und Helligkeit "
+               "bleiben — so passt Fremdmaterial zum Artwork desselben Tracks.")
+    vid = st.file_uploader("Videoclip", type=["mp4", "mov", "m4v", "webm"])
+    if not vid:
+        st.info("Lade einen Clip — erst den Vorschau-Frame, dann rendern.")
+        return
+
+    st.image(footage.ramp_strip(stops, w=900, h=28),
+             caption="Gradient Map: dunkel -> hell", width="stretch")
+    c1, c2, c3 = st.columns(3)
+    f_str = c1.slider("Staerke", 0.0, 1.0, 1.0, 0.05,
+                      help="0 = Original, 1 = ganz auf die Palette.")
+    f_con = c2.slider("Kontrast (vor dem Mapping)", 0.5, 2.0, 1.0, 0.05,
+                      help="Verschiebt, welche Helligkeiten wo auf der Rampe "
+                           "landen.")
+    f_grain = c3.slider("Korn", 0.0, 1.0, 0.0, 0.05)
+    c4, c5, c6 = st.columns(3)
+    f_fmt = c4.selectbox("Zielformat", footage.FOOTAGE_SIZES)
+    f_aud = c5.selectbox("Audio", footage.AUDIO_MODES)
+
+    try:
+        pfad = _stash(vid.getvalue(), "." + vid.name.rsplit(".", 1)[-1])
+        dauer = ffmpeg.duration(pfad)
+    except ModuleNotFoundError:
+        st.error("Footage braucht: pip install imageio-ffmpeg")
+        return
+    t_max = round(max(0.1, (dauer or 5.0) - 0.1), 1)
+    f_t = c6.slider("Vorschau-Zeitpunkt (s)", 0.0, t_max, min(1.0, t_max), 0.1)
+
+    groesse = SIZES[f_fmt]
+    stand = (vid.name, len(vid.getvalue()), tuple(stops), f_t, f_fmt,
+             f_str, f_con, f_grain)
+    b1, b2 = st.columns(2)
+
+    if b1.button("Vorschau-Frame", type="primary", width="stretch"):
+        try:
+            with st.spinner("Frame ..."):
+                ss["footage_prev"] = (stand, footage.preview_frame(
+                    pfad, _stash_clut(tuple(stops)), t=f_t, size=groesse,
+                    contrast=f_con, strength=f_str, grain=f_grain))
+        except ModuleNotFoundError:
+            st.error("Footage braucht: pip install imageio-ffmpeg")
+        except Exception as e:
+            ss.pop("footage_prev", None)
+            st.error(f"Vorschau-Fehler: {e}")
+
+    if b2.button(f"Video rendern ({groesse[0]}x{groesse[1]})", width="stretch"):
+        try:
+            with st.spinner("Rendere Video (kann dauern) ..."):
+                track = (_stash(up.getvalue(), "." + up.name.rsplit(".", 1)[-1])
+                         if f_aud == "Track-Audio" else None)
+                outp = tempfile.NamedTemporaryFile(suffix=".mp4",
+                                                   delete=False).name
+                footage.render_clip(pfad, _stash_clut(tuple(stops)), outp,
+                                    size=groesse, contrast=f_con,
+                                    strength=f_str, grain=f_grain,
+                                    audio_mode=f_aud, track=track)
+                ss["footage_mp4"] = open(outp, "rb").read()
+            st.success(f"{len(ss['footage_mp4']) / 1e6:.1f} MB")
+        except ModuleNotFoundError:
+            st.error("Footage braucht: pip install imageio-ffmpeg")
+        except Exception as e:
+            st.error(f"Render-Fehler: {e}")
+
+    vor = ss.get("footage_prev")
+    if vor and vor[0] == stand:
+        st.image(vor[1], caption=f"Vorschau bei {f_t:.1f} s — "
+                                 f"{groesse[0]}x{groesse[1]}")
+    elif vor:
+        st.info("Einstellungen geaendert — Vorschau neu erzeugen.")
+
+    if ss.get("footage_mp4"):
+        v1, v2 = st.columns([2, 3])
+        with v1:
+            st.video(ss["footage_mp4"])
+        v2.download_button("MP4 laden", ss["footage_mp4"], "footage.mp4",
+                           "video/mp4", width="stretch")
+
+
 def tab_album(cmap):
     st.caption("Ein Ordner mit Titeln wird zur Serie: die Palettenstruktur "
                "bleibt, der Farbton wandert pro Titel innerhalb der Spreizung. "
@@ -1120,12 +1220,14 @@ def main():
         except Exception as e:
             st.error(f"Bild konnte nicht gelesen werden: {e}")
 
-    t1, t2, t3 = st.tabs(["Bild", "Video", "Album"])
+    t1, t2, t3, t4 = st.tabs(["Bild", "Video", "Footage", "Album"])
     with t1:
         tab_bild(an, up.name, cmap, img_pic, sig_path, up)
     with t2:
         tab_video(an, up.name, cmap, up)
     with t3:
+        tab_footage(up)
+    with t4:
         tab_album(cmap)
     spiegeln(st.session_state.get("_knobs"))
 

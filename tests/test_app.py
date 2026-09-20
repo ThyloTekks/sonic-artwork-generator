@@ -455,3 +455,71 @@ def test_farbstufen_hochschalten_liefert_keine_schwarzen_felder(app_mit_audio):
     felder = [c.value for c in at.color_picker if c.key and c.key.startswith("c")]
     assert len(felder) == 6
     assert "#000000" not in felder, felder
+
+
+# ----------------------------------------------------------------------
+# Footage-Tab
+# ----------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def app_mit_clip(tmp_path_factory):
+    """Kopie der App, bei der Audio- UND Video-Uploader feste Dateien liefern."""
+    from sonicart import ffmpeg
+
+    d = tmp_path_factory.mktemp("clipapp")
+    wav = d / "t.wav"
+    sr = 22050
+    t = np.linspace(0, 6, 6 * sr, endpoint=False)
+    y = sum(np.sin(2 * np.pi * f * t) for f in (220, 277, 330)) / 3 * 0.5
+    sf.write(wav, y.astype(np.float32), sr)
+
+    clip = d / "clip.mp4"
+    ffmpeg.run(["-y", "-loglevel", "error", "-f", "lavfi",
+                "-i", "testsrc=size=320x240:rate=25:duration=2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)])
+
+    stub = d / "app_stub.py"
+    stub.write_text(textwrap.dedent(f"""
+        import sys, io
+        sys.path.insert(0, {str(PROJEKT)!r})
+        import streamlit as st
+        WAV = open({str(wav)!r}, "rb").read()
+        MP4 = open({str(clip)!r}, "rb").read()
+
+        class FakeUpload(io.BytesIO):
+            def __init__(self, data, name):
+                super().__init__(data)
+                self.name = name
+
+        def _upload(label, **kw):
+            if "Audiodatei" in label:
+                return FakeUpload(WAV, "t.wav")
+            if "Videoclip" in label:
+                return FakeUpload(MP4, "clip.mp4")
+            return None
+
+        st.file_uploader = _upload
+
+        import sonic_artwork as app
+        app.main()
+    """))
+    return str(stub)
+
+
+def test_footage_tab_laeuft_mit_clip(app_mit_clip):
+    at = AppTest.from_file(app_mit_clip, default_timeout=600)
+    at.run()
+    assert not at.exception, [getattr(e, "message", e) for e in at.exception]
+    assert not at.error, [e.value for e in at.error]
+    assert [b for b in at.button if b.label == "Vorschau-Frame"], \
+        [b.label for b in at.button]
+
+
+def test_footage_vorschau_zeichnet_ein_bild(app_mit_clip):
+    """Der Knopf muss wirklich einen Frame liefern, nicht bloss existieren."""
+    at = AppTest.from_file(app_mit_clip, default_timeout=600)
+    at.run()
+    vorher = _zaehle(at, "Image")
+    [b for b in at.button if b.label == "Vorschau-Frame"][0].click().run()
+    assert not at.exception, [getattr(e, "message", e) for e in at.exception]
+    assert not at.error, [e.value for e in at.error]
+    assert _zaehle(at, "Image") == vorher + 1
