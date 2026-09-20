@@ -156,6 +156,33 @@ das erste zurück. Gemessen in `tests/test_video.py`: der Sprung am
 Schleifenpunkt fällt von über dem Doppelten eines normalen Bildabstands auf
 unter einen.
 
+## Footage
+
+Handyclips und Screen-Recordings passen farblich nie zum Artwork desselben
+Tracks. Der Reiter *Footage* legt sie auf dieselbe Palette: Aus den
+Palettenstops entsteht eine Hald-CLUT der Stufe 8 — eine Gradient Map, die
+jeden Eingangsfarbwert durch die Palettenfarbe seiner OKLab-Helligkeit
+ersetzt. Der Farbton des Originals fällt weg, Struktur und
+Helligkeitsverlauf bleiben. ffmpeg wendet die Tabelle mit `haldclut` an.
+
+Interpoliert wird zwischen den Stops in OKLCH, nicht in sRGB, und die
+Rückrechnung senkt bei Bedarf die Chroma (`oklch_to_hex(fit=True)`), statt
+Kanäle abzuschneiden — sonst verbiegt sich die Helligkeitskurve genau da,
+wo die Palette kräftig wird.
+
+Regler: Stärke (0 = Original, 1 = ganz auf die Palette), Kontrast vor dem
+Mapping, Korn, Zielformat (9:16 · 1:1 · 16:9, Center-Crop statt Stauchung)
+und Audio (Originalton · Track-Audio · stumm). Weil ein voller Render
+Minuten kostet, steht davor ein einzelner gemappter Frame als Standbild;
+Vorschau und Export teilen sich denselben Filtergraph, damit das Standbild
+nicht lügen kann.
+
+Zwei Dinge stehen als Kommentar im Code, weil beide beim Lesen falsch
+wirken: Bei ffmpegs `blend` ist der *erste* Eingang die obere Ebene — steht
+dort das Original, ist der Stärkeregler invertiert. Und die Bitrate braucht
+einen Deckel, weil x264 das Korn sonst originalgetreu kodiert und eine
+Minute damit auf über ein Gigabyte wächst.
+
 ## Druck
 
 Die Palettenprüfung meldet Farben außerhalb des Offset-Farbraums und zeigt,
@@ -164,8 +191,9 @@ Faktor 2,2. Näherung ohne ICC-Profil — ein Warnsignal, kein Proof.
 
 ## Oberfläche
 
-Links die Vorschau, rechts das Steuerpult mit fünf Reitern (Form · Farbe ·
-Druck · Text · Aufbau), darunter der Export in Leserichtung. Die Seitenleiste
+Vier Reiter im Hauptbereich: Bild · Video · Footage · Album. Im Bild-Reiter
+links die Vorschau, rechts das Steuerpult mit fünf Unterreitern (Form ·
+Farbe · Druck · Text · Aufbau), darunter der Export in Leserichtung. Die Seitenleiste
 trägt nur, was die Sitzung eröffnet: Audiodatei, Live-Vorschau, Sperrflächen,
 Rezept, eigene Dateien.
 
@@ -202,7 +230,9 @@ sonicart/
   fonts/          mitgelieferte Schriften (SIL OFL)
   artwork.py      Rezept + Pipeline
   export.py       Social-Formate, SVG, PNG-Metadaten, Abgabeprüfung
+  ffmpeg.py       Pfad zur Binary, Aufruf, Laufzeit auslesen
   video.py        Canvas und Reel
+  footage.py      Fremdmaterial auf die Palette legen (Hald-CLUT)
   album.py        Serie statt Einzelbild
   cli.py          Kommandozeile
 sonic_artwork.py  Streamlit-Oberfläche
