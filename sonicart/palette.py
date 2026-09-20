@@ -59,7 +59,8 @@ def make_cmap(hex_colors):
 # sRGB <-> OKLab/OKLCH  (Bjoern Ottosson)
 # ----------------------------------------------------------------------
 def _srgb_lin(c):
-    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    c = np.asarray(c, float)                     # skalar- und arraytauglich
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
 def _lin_srgb(c):
@@ -67,15 +68,30 @@ def _lin_srgb(c):
     return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
 
 
-def hex_to_oklch(hx: str) -> tuple[float, float, float]:
-    r, g, b = (_srgb_lin(v) for v in hex_to_rgb01(hx))
+def linrgb_to_oklab(r, g, b):
+    """Lineares sRGB -> OKLab. Einzige Quelle der Matrizen (skalar oder Array)."""
     l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
     m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
     s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-    l_, m_, s_ = np.cbrt([l, m, s])
-    L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
-    a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
-    bb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+    l_, m_, s_ = np.cbrt(l), np.cbrt(m), np.cbrt(s)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def oklab_L(rgb01):
+    """Perzeptuelle Helligkeit 0..1 zu sRGB-Werten; letzte Achse ist RGB.
+
+    Nimmt ein einzelnes Tripel ebenso wie ein ganzes Bild. Gedacht fuer
+    Gradient Maps, die nach Helligkeit einfaerben: die OKLab-Helligkeit
+    trifft das Auge besser als eine gewichtete RGB-Summe.
+    """
+    lin = _srgb_lin(np.asarray(rgb01, float))
+    return linrgb_to_oklab(*np.moveaxis(lin, -1, 0))[0]
+
+
+def hex_to_oklch(hx: str) -> tuple[float, float, float]:
+    L, a, bb = linrgb_to_oklab(*(_srgb_lin(v) for v in hex_to_rgb01(hx)))
     return float(L), float(np.hypot(a, bb)), float(np.arctan2(bb, a))
 
 
