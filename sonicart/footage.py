@@ -112,10 +112,15 @@ def graph(w: int, h: int, contrast: float = 1.0, strength: float = 1.0,
 
 
 def _audio_args(audio_mode: str, has_track: bool) -> list[str]:
-    """Originalton aus dem Clip, Track-Audio (Eingang 2) oder stumm."""
+    """Originalton aus dem Clip, Track-Audio (Eingang 2) oder stumm.
+
+    Track-Audio ohne Track faellt auf den Originalton zurueck statt auf
+    stumm: Ton war gewuenscht, und ein lautloses Video ist das Einzige, was
+    in dem Fall sicher falsch ist.
+    """
     if audio_mode == "Track-Audio" and has_track:
         return ["-map", "2:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]
-    if audio_mode == "Originalton":
+    if audio_mode != "stumm":
         return ["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"]
     return ["-an"]
 
