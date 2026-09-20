@@ -523,3 +523,55 @@ def test_footage_vorschau_zeichnet_ein_bild(app_mit_clip):
     assert not at.exception, [getattr(e, "message", e) for e in at.exception]
     assert not at.error, [e.value for e in at.error]
     assert _zaehle(at, "Image") == vorher + 1
+
+
+@pytest.fixture(scope="module")
+def app_ohne_footage(tmp_path_factory):
+    """App, in der sonicart.footage nicht importierbar ist.
+
+    Bildet den Fall nach, der die oeffentliche App einmal komplett lahmgelegt
+    hat: ein unvollstaendiger Checkout, bei dem footage.py einen Namen aus
+    palette.py zog, den die dortige Fassung noch nicht hatte.
+    """
+    d = tmp_path_factory.mktemp("nofootage")
+    wav = d / "t.wav"
+    sr = 22050
+    t = np.linspace(0, 6, 6 * sr, endpoint=False)
+    sf.write(wav, (np.sin(2 * np.pi * 220 * t) * 0.5).astype(np.float32), sr)
+
+    stub = d / "app_stub.py"
+    stub.write_text(textwrap.dedent(f"""
+        import sys, io
+        sys.path.insert(0, {str(PROJEKT)!r})
+        #  Import von sonicart.footage scheitern lassen. Das Attribut am Paket
+        #  muss mit weg: ein einmal importiertes Submodul haengt dort und
+        #  wuerde den None-Eintrag in sys.modules sonst ueberholen — sonst
+        #  haengt das Ergebnis davon ab, welcher Test vorher lief.
+        import sonicart
+        sonicart.__dict__.pop("footage", None)
+        sys.modules["sonicart.footage"] = None
+        import streamlit as st
+        WAV = open({str(wav)!r}, "rb").read()
+
+        class FakeUpload(io.BytesIO):
+            name = "t.wav"
+
+        st.file_uploader = lambda label, **kw: (
+            FakeUpload(WAV) if "Audiodatei" in label else None)
+
+        import sonic_artwork as app
+        app.main()
+    """))
+    return str(stub)
+
+
+def test_kaputtes_footage_legt_die_app_nicht_lahm(app_ohne_footage):
+    """Bild, Video und Album muessen weiterlaufen, wenn Footage ausfaellt."""
+    at = AppTest.from_file(app_ohne_footage, default_timeout=300)
+    at.run()
+    assert not at.exception, [getattr(e, "message", e) for e in at.exception]
+    #  Das Vorschaubild des Bild-Reiters steht weiterhin
+    assert _zaehle(at, "Image") == 1
+    #  und der Ausfall wird dort gemeldet, wo er hingehoert
+    assert any("Footage nicht verfuegbar" in e.value for e in at.error), \
+        [e.value for e in at.error]

@@ -22,7 +22,6 @@ import tempfile
 import streamlit as st
 from PIL import Image
 
-from sonicart import ffmpeg, footage
 from sonicart.album import render_album
 from sonicart.analysis import Analysis, load
 from sonicart.artwork import DEFAULT_PARAMS, Recipe, build
@@ -75,6 +74,7 @@ def _stash(data: bytes, suffix: str) -> str:
 @st.cache_data(show_spinner=False, max_entries=8)
 def _stash_clut(stops: tuple) -> str:
     """Ein CLUT je Palette — 262144 Eintraege lohnen das Aufheben."""
+    from sonicart import footage
     return footage.clut_file(list(stops))
 
 
@@ -1062,7 +1062,18 @@ def tab_video(an, audio_name, cmap, up):
 
 
 def tab_footage(up):
-    """Fremdmaterial auf die Palette dieses Tracks bringen."""
+    """Fremdmaterial auf die Palette dieses Tracks bringen.
+
+    ffmpeg und das Footage-Modul werden erst hier geladen, wie animate() im
+    Video-Reiter. Ein optionales Feature darf die App nicht am Start
+    hindern — faellt hier etwas aus, bleiben Bild, Video und Album nutzbar.
+    """
+    try:
+        from sonicart import ffmpeg, footage
+    except Exception as e:
+        st.error(f"Footage nicht verfuegbar: {e}")
+        return
+
     ss = st.session_state
     stops = stops_from_state()
     st.caption("Beliebigen Clip ueber die Palette dieses Tracks einfaerben. "
