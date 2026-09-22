@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image, ImageFilter
 
-from .palette import hex_to_rgb
+from .palette import hex_to_rgb, oklab_L
 
 #  Erprobte Farbsaetze. Reihenfolge: hellste zuerst, dunkelste zuletzt —
 #  die Platten drucken in dieser Reihenfolge uebereinander.
@@ -122,6 +122,11 @@ def paper_texture(arr: np.ndarray, staerke: float, seed: int = 3) -> np.ndarray:
     return np.clip(arr * (1 - staerke + 2 * staerke * faser[..., None]), 0, 1)
 
 
+def _helligkeit(hex_farbe: str) -> float:
+    """Wahrgenommene Helligkeit einer Druckfarbe, 0..1."""
+    return float(oklab_L(np.array(hex_to_rgb(hex_farbe)) / 255.0))
+
+
 def apply_riso(img: Image.Image, spec: RisoSpec, bg: str = "#000000",
                keep_alpha: bool = False) -> Image.Image:
     """Fertiges Bild -> Druck. Gibt RGB zurueck (oder RGBA, wenn gewuenscht)."""
@@ -140,14 +145,28 @@ def apply_riso(img: Image.Image, spec: RisoSpec, bg: str = "#000000",
     out = np.ones((*d.shape, 3)) * papier
     modus = spec.effective_overprint()
     n = len(spec.inks)
-    for i, farbe in enumerate(spec.inks):
-        lo, hi = i / n, (i + 1) / n
+    #  Welches Tonwertband eine Farbe bekommt, entscheidet ihre Helligkeit,
+    #  nicht ihre Position in der Liste. Farbsaetze fuehren die dunkle Farbe
+    #  zuletzt, eine Palette dagegen zuerst (dunkel -> hell). Nach Position zu
+    #  gehen legte deshalb bei jeder geladenen Palette das Fast-Schwarz auf das
+    #  unterste Band — und weil jede Platte alles Dunklere voll ueberdruckt,
+    #  zog Multiply die ganze Flaeche nach Schwarz: alle Paletten sahen gleich
+    #  aus. Hellste Farbe auf die hellsten Toene, dunkelste auf die tiefsten.
+    nach_helligkeit = sorted(range(n), key=lambda i: -_helligkeit(spec.inks[i]))
+    for platz, i in enumerate(nach_helligkeit):
+        farbe = spec.inks[i]
+        lo, hi = platz / n, (platz + 1) / n
         # Tonwertbereich dieser Platte; alles Dunklere wird voll ueberdruckt.
         platte = np.clip((d - lo) / (hi - lo + 1e-9), 0, 1)
         platte = np.maximum(platte, (d > hi).astype(float))
+        #  Winkel und Versatz haengen am Band, nicht an der Listenposition.
+        #  Die Winkel sollen sich nur voneinander unterscheiden (sonst Moire);
+        #  welche Farbe welchen bekommt, ist gleichgueltig. So ist der Druck
+        #  vollstaendig unabhaengig davon, in welcher Reihenfolge die Farben
+        #  hereinkommen.
         maske = halftone_mask(platte, zelle,
-                              spec.angles[i % len(spec.angles)])
-        dy, dx = spec.offsets[i % len(spec.offsets)]
+                              spec.angles[platz % len(spec.angles)])
+        dy, dx = spec.offsets[platz % len(spec.offsets)]
         versatz = spec.misregister * skala
         maske = np.roll(np.roll(maske, int(round(dy * versatz)), 0),
                         int(round(dx * versatz)), 1)

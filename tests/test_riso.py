@@ -130,3 +130,64 @@ def test_ohne_riso_bleibt_alles_beim_alten(an):
     r = Recipe(mode="Rose roh", size=160)
     assert r.riso is None and r.riso_spec is None
     assert build(an, r, 160).size == (160, 160)
+
+
+# ----------------------------------------------------------------------
+# Plattenfolge: welche Farbe welches Tonwertband bekommt
+# ----------------------------------------------------------------------
+def _graukeil(n=300):
+    """Bild mit vollem Tonwertumfang — unabhaengig vom Rendern."""
+    g = np.linspace(0, 1, n)
+    return Image.fromarray(
+        np.repeat((np.tile(g, (n, 1))[..., None] * 255).astype("uint8"), 3, 2), "RGB")
+
+
+def _druck(inks, paper="#efe9dd"):
+    return np.asarray(apply_riso(_graukeil(),
+                                 RisoSpec(inks=list(inks), paper=paper, texture=0.0),
+                                 "#000000")).astype(float)
+
+
+def _saettigung(a):
+    a = a / 255.0
+    return float(np.mean((a.max(2) - a.min(2)) / (a.max(2) + 1e-9)))
+
+
+def test_palette_faerbt_den_druck():
+    """Der Fehler: jede geladene Palette druckte dasselbe Schwarz-Weiss.
+
+    Palettenstufen laufen dunkel -> hell, Farbsaetze dagegen hell -> dunkel.
+    Solange das Tonwertband an der Listenposition hing, bekam bei jeder
+    Palette das Fast-Schwarz das unterste Band und ueberdruckte per Multiply
+    die ganze Flaeche — Korrend und Seek unterschieden sich um 2,9 von 255.
+    """
+    from sonicart.palette import PRESETS
+    a, b = _druck(PRESETS["Korrend"]), _druck(PRESETS["Seek"])
+    assert np.abs(a - b).mean() > 25, "Palettenwechsel bleibt ohne Wirkung"
+
+
+def test_dunkle_erste_stufe_schluckt_das_bild_nicht():
+    """Eine Palette, die mit Fast-Schwarz beginnt, darf nicht grau werden."""
+    bunt = _druck(["#08060d", "#3a1d6e", "#7b2ff7", "#c9a0ff"])
+    assert _saettigung(bunt) > 0.3, "Druck ist entfaerbt"
+
+
+def test_plattenfolge_haengt_nicht_an_der_listenreihenfolge():
+    """Dieselben Farben in anderer Reihenfolge ergeben denselben Druck.
+
+    Damit kann kein Aufrufer die Zuordnung mehr kippen, indem er die Farben
+    anders herum uebergibt — genau das war der Ausloeser.
+    """
+    farben = ["#0d0606", "#7a1420", "#e23b2e", "#ffb37a"]
+    vorwaerts = _druck(farben)
+    rueckwaerts = _druck(list(reversed(farben)))
+    assert np.abs(vorwaerts - rueckwaerts).max() == 0
+
+
+def test_hellste_farbe_bekommt_die_hellsten_toene():
+    """Heller Tonwert -> helle Farbe, tiefer Tonwert -> dunkle Farbe."""
+    a = _druck(["#101010", "#f0d070"])          # dunkel + hell
+    hell_bereich = a[:, :30]                    # linker Rand = niedrige Dichte
+    tief_bereich = a[:, -30:]                   # rechter Rand = hohe Dichte
+    assert _lum(hell_bereich.reshape(-1, 3)).mean() > \
+           _lum(tief_bereich.reshape(-1, 3)).mean()
